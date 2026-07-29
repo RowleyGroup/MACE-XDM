@@ -196,27 +196,41 @@ physical units via `physical = mean[Z] + std[Z] * standardized`.
 
 ### Dataset format
 
-Training data is expected as an ANI-style HDF5 file: one group per molecular
-formula, with conformers batched together within each group.
+Training data is expected as one or more ANI-style HDF5 files, e.g. many files
+each covering a batch of molecules (as produced by successive active-learning
+rounds). Per-molecule groups may be nested under an arbitrary wrapper group
+(e.g. a batch/run name) — the actual leaf groups (the ones holding datasets)
+are discovered automatically at any depth:
 
 ```
-/<formula>/species       [n_atoms] or [n_conf, n_atoms]   (atomic numbers or element symbols)
-/<formula>/coordinates   [n_conf, n_atoms, 3]              (Angstrom)
-/<formula>/M1            [n_conf, n_atoms]
-/<formula>/M2            [n_conf, n_atoms]
-/<formula>/M3            [n_conf, n_atoms]
-/<formula>/Veff          [n_conf, n_atoms]
+/<wrapper>/<molecule>/atomic_numbers   [n_atoms]                          (uint8/int)
+/<wrapper>/<molecule>/coordinates      [n_conf, n_atoms, 3]               (Angstrom)
+/<wrapper>/<molecule>/M1               [n_conf, n_atoms]
+/<wrapper>/<molecule>/M2               [n_conf, n_atoms]
+/<wrapper>/<molecule>/M3               [n_conf, n_atoms]
+/<wrapper>/<molecule>/Veff             [n_conf, n_atoms]
 ```
 
-Key names (`species`, `coordinates`, `M1`, `M2`, `M3`, `Veff`) can be
-overridden with `--species_key`, `--coordinates_key`, and `--target_keys` if
-your file uses different names.
+`<wrapper>` may be absent entirely (molecule groups directly at the file's
+top level) or nested to any depth — both are handled the same way. The species
+key defaults to `atomic_numbers` (an integer array); a symbol array (e.g.
+`species`, with entries like `b"H"`, `b"C"`) is also supported via
+`--species_key=species`. Key names (`coordinates`, `M1`, `M2`, `M3`, `Veff`)
+can be overridden with `--coordinates_key` and `--target_keys` if your files
+use different names.
+
+If the same molecule name appears in more than one file (e.g. each file
+contributes one new conformer per molecule from a round of active learning),
+all of their conformers are pooled together under that molecule name.
 
 ### Training
 
+Pass one or more files and/or glob patterns via `--train_files` to cover a
+whole directory of per-batch HDF5 files:
+
 ```sh
 mace_run_train_xdm \
-    --train_file="your_xdm_dataset.h5" \
+    --train_files "data/pbe0xdm-ani2x_*.hdf5" \
     --valid_fraction=0.1 \
     --r_max=5.0 \
     --hidden_irreps="128x0e + 128x1o" \
@@ -226,11 +240,11 @@ mace_run_train_xdm \
     --name="xdm_model"
 ```
 
-Validation is a held-out set of molecular formula groups (not individual
-conformers), so validation molecules are never seen during training even
-across conformers. Per-element mean/std statistics used for standardization
-are computed from the training groups only and stored in the checkpoint. The
-best model (lowest validation loss) is saved to
+Validation is a held-out set of molecule names (not individual conformers),
+so a validation molecule's conformers are never seen during training, even
+across different files. Per-element mean/std statistics used for
+standardization are computed from the training molecules only and stored in
+the checkpoint. The best model (lowest validation loss) is saved to
 `<model_dir>/<name>.model`, ready for evaluation or downstream use.
 
 ### Evaluation

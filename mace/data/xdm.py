@@ -1,10 +1,10 @@
 ###########################################################################################
 # Data handling for training MACE to predict per-atom XDM dispersion coefficients
-# (M1, M2, M3, Veff) from an ANI-style HDF5 dataset.
+# (M1, M2, M3, Veff) from an ANI-style HDF5 dataset spread across one or more files.
 ###########################################################################################
 
 import logging
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple, Union
 
 import h5py
 import numpy as np
@@ -17,6 +17,43 @@ from .atomic_data import AtomicData
 from .neighborhood import get_neighborhood
 
 DEFAULT_TARGET_KEYS: Tuple[str, str, str, str] = ("M1", "M2", "M3", "Veff")
+
+FilePaths = Union[str, Sequence[str]]
+
+
+def _as_file_list(file_paths: FilePaths) -> List[str]:
+    return [file_paths] if isinstance(file_paths, str) else list(file_paths)
+
+
+def find_leaf_groups(node: h5py.Group, path: str = "") -> List[str]:
+    """Recursively find the HDF5 paths of "leaf" groups (whose direct children
+    are datasets rather than further sub-groups), at any nesting depth.
+
+    Molecule groups in these ANI-style files are not always at the top level of
+    the file (there may be an extra wrapper group per file, e.g. a batch/run
+    name); this walks down through any such wrapper groups to find the actual
+    per-molecule groups.
+    """
+    children = list(node.items())
+    has_subgroup = any(isinstance(v, h5py.Group) for _, v in children)
+    has_dataset = any(isinstance(v, h5py.Dataset) for _, v in children)
+
+    leaves = []
+    if has_dataset and not has_subgroup:
+        leaves.append(path)
+    if has_subgroup:
+        for name, child in children:
+            if isinstance(child, h5py.Group):
+                child_path = f"{path}/{name}" if path else name
+                leaves.extend(find_leaf_groups(child, child_path))
+    return leaves
+
+
+def molecule_name(leaf_path: str) -> str:
+    """The trailing path component of a leaf group, used as the molecule's
+    identity for train/valid splitting and for merging conformers of the same
+    molecule that are stored in different files."""
+    return leaf_path.rsplit("/", 1)[-1]
 
 
 def species_to_atomic_numbers(species: np.ndarray) -> np.ndarray:
@@ -88,64 +125,83 @@ def build_xdm_atomic_data(
 
 
 class XDMHDF5Dataset(torch.utils.data.Dataset):
-    """Reads an ANI-style HDF5 file of molecules labeled with atomic XDM coefficients.
+    """Reads one or more ANI-style HDF5 files of molecules labeled with atomic
+    XDM coefficients.
 
-    Expected layout (one group per molecular formula, conformers batched together,
-    matching the conventions used by TorchANI-style datasets)::
+    Each file may nest its per-molecule groups under an arbitrary number of
+    wrapper groups (e.g. a batch/run name); the actual leaf groups (the ones
+    holding datasets) are discovered automatically at any depth. Within a leaf
+    group::
 
-        /<formula>/<species_key>       [n_atoms] or [n_conf, n_atoms]
-        /<formula>/<coordinates_key>   [n_conf, n_atoms, 3]  (Angstrom)
-        /<formula>/<M1, M2, M3, Veff>  each [n_conf, n_atoms]
+        .../<molecule>/<species_key>       [n_atoms] or [n_conf, n_atoms]
+        .../<molecule>/<coordinates_key>   [n_conf, n_atoms, 3]  (Angstrom)
+        .../<molecule>/<M1, M2, M3, Veff>  each [n_conf, n_atoms]
 
-    ``species`` may either be a fixed per-formula array of atomic numbers/symbols
-    (shape ``[n_atoms]``, shared by every conformer in the group) or vary per
-    conformer (shape ``[n_conf, n_atoms]``); both are handled.
+    ``species_key`` defaults to ``atomic_numbers`` (an integer array); a
+    ``species`` array of element symbols (bytes or str) is also supported by
+    passing ``species_key="species"``. Either may be a fixed per-molecule
+    array (shape ``[n_atoms]``) or vary per conformer (shape ``[n_conf, n_atoms]``).
+
+    If the same molecule name appears in more than one file (e.g. successive
+    active-learning batches each contributing a new conformer), all of their
+    conformers are pooled under that molecule for this dataset. Pass
+    ``molecule_names`` to restrict to a specific subset (e.g. for a train/valid
+    split by molecule identity).
     """
 
     def __init__(
         self,
-        file_path: str,
+        file_paths: FilePaths,
         z_table: AtomicNumberTable,
         r_max: float,
         target_keys: Sequence[str] = DEFAULT_TARGET_KEYS,
-        species_key: str = "species",
+        species_key: str = "atomic_numbers",
         coordinates_key: str = "coordinates",
-        groups: Optional[List[str]] = None,
+        molecule_names: Optional[Sequence[str]] = None,
     ):
         super().__init__()
-        self.file_path = file_path
-        self._file = None
+        self.file_paths = _as_file_list(file_paths)
+        self._files: Dict[int, h5py.File] = {}
         self.z_table = z_table
         self.r_max = r_max
         self.target_keys = list(target_keys)
         self.species_key = species_key
         self.coordinates_key = coordinates_key
+        molecule_name_filter = (
+            set(molecule_names) if molecule_names is not None else None
+        )
 
-        self.index: List[Tuple[str, int]] = []
-        with h5py.File(file_path, "r") as f:
-            group_names = list(groups) if groups is not None else list(f.keys())
-            for name in group_names:
-                n_conf = f[name][coordinates_key].shape[0]
-                self.index.extend((name, i) for i in range(n_conf))
-        self.group_names = group_names
+        # index entries: (file_idx, leaf_path, conformer_idx)
+        self.index: List[Tuple[int, str, int]] = []
+        for file_idx, path in enumerate(self.file_paths):
+            with h5py.File(path, "r") as f:
+                for leaf_path in find_leaf_groups(f):
+                    if (
+                        molecule_name_filter is not None
+                        and molecule_name(leaf_path) not in molecule_name_filter
+                    ):
+                        continue
+                    n_conf = f[leaf_path][coordinates_key].shape[0]
+                    self.index.extend(
+                        (file_idx, leaf_path, i) for i in range(n_conf)
+                    )
 
-    @property
-    def file(self) -> h5py.File:
-        if self._file is None:
-            self._file = h5py.File(self.file_path, "r")
-        return self._file
+    def _file(self, file_idx: int) -> h5py.File:
+        if file_idx not in self._files:
+            self._files[file_idx] = h5py.File(self.file_paths[file_idx], "r")
+        return self._files[file_idx]
 
     def __getstate__(self):
         state = dict(self.__dict__)
-        state["_file"] = None
+        state["_files"] = {}
         return state
 
     def __len__(self) -> int:
         return len(self.index)
 
     def __getitem__(self, idx: int) -> AtomicData:
-        group_name, conf_idx = self.index[idx]
-        grp = self.file[group_name]
+        file_idx, leaf_path, conf_idx = self.index[idx]
+        grp = self._file(file_idx)[leaf_path]
 
         species = grp[self.species_key]
         species_arr = species[conf_idx] if species.ndim == 2 else species[()]
@@ -166,62 +222,86 @@ class XDMHDF5Dataset(torch.utils.data.Dataset):
         )
 
 
+def discover_molecule_names(
+    file_paths: FilePaths,
+) -> List[str]:
+    """Union of molecule (leaf-group) names across one or more HDF5 files."""
+    names = set()
+    for path in _as_file_list(file_paths):
+        with h5py.File(path, "r") as f:
+            names.update(molecule_name(p) for p in find_leaf_groups(f))
+    return sorted(names)
+
+
 def discover_atomic_number_table(
-    file_path: str,
-    species_key: str = "species",
-    groups: Optional[List[str]] = None,
+    file_paths: FilePaths,
+    species_key: str = "atomic_numbers",
+    molecule_names: Optional[Sequence[str]] = None,
 ) -> AtomicNumberTable:
-    """Scan an XDM HDF5 dataset for the set of chemical elements present."""
+    """Scan one or more XDM HDF5 files for the set of chemical elements present."""
+    molecule_name_filter = set(molecule_names) if molecule_names is not None else None
     zs = set()
-    with h5py.File(file_path, "r") as f:
-        group_names = list(groups) if groups is not None else list(f.keys())
-        for name in group_names:
-            atomic_numbers = species_to_atomic_numbers(f[name][species_key][()])
-            zs.update(int(z) for z in np.asarray(atomic_numbers).reshape(-1))
+    for path in _as_file_list(file_paths):
+        with h5py.File(path, "r") as f:
+            for leaf_path in find_leaf_groups(f):
+                if (
+                    molecule_name_filter is not None
+                    and molecule_name(leaf_path) not in molecule_name_filter
+                ):
+                    continue
+                atomic_numbers = species_to_atomic_numbers(f[leaf_path][species_key][()])
+                zs.update(int(z) for z in np.asarray(atomic_numbers).reshape(-1))
     return AtomicNumberTable(sorted(zs))
 
 
 def compute_xdm_element_statistics(
-    file_path: str,
+    file_paths: FilePaths,
     z_table: AtomicNumberTable,
     target_keys: Sequence[str] = DEFAULT_TARGET_KEYS,
-    species_key: str = "species",
+    species_key: str = "atomic_numbers",
     coordinates_key: str = "coordinates",
-    groups: Optional[List[str]] = None,
+    molecule_names: Optional[Sequence[str]] = None,
     std_floor: float = 1e-6,
 ) -> Dict[str, np.ndarray]:
     """Compute per-element mean/std of each XDM target property.
 
-    Streams through every conformer of every group once, accumulating sums and
-    sums-of-squares per element per property, then returns the resulting
-    ``mean``/``std`` arrays of shape ``[len(z_table), len(target_keys)]``, ready
-    to feed into ``AtomicElementReferenceBlock``/``AtomicXDMMACE``.
+    Streams through every conformer of every molecule group once (across all
+    given files), accumulating sums and sums-of-squares per element per
+    property, then returns the resulting ``mean``/``std`` arrays of shape
+    ``[len(z_table), len(target_keys)]``, ready to feed into
+    ``AtomicElementReferenceBlock``/``AtomicXDMMACE``.
     """
+    molecule_name_filter = set(molecule_names) if molecule_names is not None else None
     n_elements = len(z_table)
     n_properties = len(target_keys)
     count = np.zeros(n_elements, dtype=np.float64)
     total = np.zeros((n_elements, n_properties), dtype=np.float64)
     total_sq = np.zeros((n_elements, n_properties), dtype=np.float64)
 
-    with h5py.File(file_path, "r") as f:
-        group_names = list(groups) if groups is not None else list(f.keys())
-        for name in group_names:
-            grp = f[name]
-            species = grp[species_key]
-            n_conf = grp[coordinates_key].shape[0]
-            targets = np.stack(
-                [np.asarray(grp[key][()], dtype=np.float64) for key in target_keys],
-                axis=-1,
-            )  # [n_conf, n_atoms, n_properties]
-            for i in range(n_conf):
-                species_arr = species[i] if species.ndim == 2 else species[()]
-                indices = atomic_numbers_to_indices(
-                    species_to_atomic_numbers(species_arr), z_table=z_table
-                )
-                for atom_idx, element_idx in enumerate(indices):
-                    count[element_idx] += 1
-                    total[element_idx] += targets[i, atom_idx]
-                    total_sq[element_idx] += targets[i, atom_idx] ** 2
+    for path in _as_file_list(file_paths):
+        with h5py.File(path, "r") as f:
+            for leaf_path in find_leaf_groups(f):
+                if (
+                    molecule_name_filter is not None
+                    and molecule_name(leaf_path) not in molecule_name_filter
+                ):
+                    continue
+                grp = f[leaf_path]
+                species = grp[species_key]
+                n_conf = grp[coordinates_key].shape[0]
+                targets = np.stack(
+                    [np.asarray(grp[key][()], dtype=np.float64) for key in target_keys],
+                    axis=-1,
+                )  # [n_conf, n_atoms, n_properties]
+                for i in range(n_conf):
+                    species_arr = species[i] if species.ndim == 2 else species[()]
+                    indices = atomic_numbers_to_indices(
+                        species_to_atomic_numbers(species_arr), z_table=z_table
+                    )
+                    for atom_idx, element_idx in enumerate(indices):
+                        count[element_idx] += 1
+                        total[element_idx] += targets[i, atom_idx]
+                        total_sq[element_idx] += targets[i, atom_idx] ** 2
 
     missing = count == 0
     if missing.any():

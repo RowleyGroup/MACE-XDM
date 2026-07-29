@@ -10,6 +10,8 @@ from mace.data.xdm import (
     build_xdm_atomic_data,
     compute_xdm_element_statistics,
     discover_atomic_number_table,
+    discover_molecule_names,
+    find_leaf_groups,
     species_to_atomic_numbers,
 )
 from mace.tools import AtomicNumberTable
@@ -18,57 +20,94 @@ from mace.tools.torch_geometric.dataloader import DataLoader
 
 torch.set_default_dtype(torch.float64)
 
+SYMBOL_TO_Z = {"H": 1, "C": 6, "N": 7, "O": 8}
 
-def _write_synthetic_dataset(path):
+
+def _write_wrapped_dataset(path, wrapper_name="ani2x_pbe0xdm_0", n_conf_h2o=6, n_conf_ch4=5):
+    """Mirrors the real layout: file -> wrapper group -> per-molecule leaf
+    groups, with 'atomic_numbers' given directly and a redundant 'species'
+    array of symbols with an odd extra trailing dimension, like the real data.
+    """
     rng = np.random.RandomState(0)
     with h5py.File(path, "w") as f:
-        # species fixed per group, shape [n_atoms]
-        grp = f.create_group("H2O")
-        n_conf = 6
-        grp.create_dataset("species", data=np.array([b"O", b"H", b"H"]))
-        base = np.array([[0.0, 0.0, 0.0], [0.0, 0.76, 0.59], [0.0, -0.76, 0.59]])
-        grp.create_dataset("coordinates", data=base[None] + rng.randn(n_conf, 3, 3) * 0.05)
-        for key in ["M1", "M2", "M3", "Veff"]:
-            grp.create_dataset(key, data=rng.rand(n_conf, 3) + 1.0)
+        wrapper = f.create_group(wrapper_name)
 
-        # species varies per conformer, shape [n_conf, n_atoms]
-        grp2 = f.create_group("CH4")
-        n_conf2 = 5
-        species2 = np.tile(np.array([b"C", b"H", b"H", b"H", b"H"]), (n_conf2, 1))
-        grp2.create_dataset("species", data=species2)
-        grp2.create_dataset("coordinates", data=rng.randn(n_conf2, 5, 3))
+        grp = wrapper.create_group("ani2x_H2O")
+        base = np.array([[0.0, 0.0, 0.0], [0.0, 0.76, 0.59], [0.0, -0.76, 0.59]])
+        species = ["O", "H", "H"]
+        grp.create_dataset(
+            "atomic_numbers", data=np.array([SYMBOL_TO_Z[s] for s in species], dtype=np.uint8)
+        )
+        grp.create_dataset("species", data=np.array([[s.encode()] for s in species]))
+        grp.create_dataset(
+            "coordinates",
+            data=(base[None] + rng.randn(n_conf_h2o, 3, 3) * 0.05).astype(np.float32),
+        )
         for key in ["M1", "M2", "M3", "Veff"]:
-            grp2.create_dataset(key, data=rng.rand(n_conf2, 5) + 2.0)
+            grp.create_dataset(key, data=rng.rand(n_conf_h2o, 3) + 1.0)
+
+        grp2 = wrapper.create_group("ani2x_CH4")
+        species2 = ["C", "H", "H", "H", "H"]
+        grp2.create_dataset(
+            "atomic_numbers", data=np.array([SYMBOL_TO_Z[s] for s in species2], dtype=np.uint8)
+        )
+        grp2.create_dataset("species", data=np.array([[s.encode()] for s in species2]))
+        grp2.create_dataset(
+            "coordinates", data=rng.randn(n_conf_ch4, 5, 3).astype(np.float32)
+        )
+        for key in ["M1", "M2", "M3", "Veff"]:
+            grp2.create_dataset(key, data=rng.rand(n_conf_ch4, 5) + 2.0)
     return path
+
+
+def test_find_leaf_groups(tmp_path):
+    path = _write_wrapped_dataset(tmp_path / "xdm.h5")
+    with h5py.File(path, "r") as f:
+        leaves = find_leaf_groups(f)
+    assert sorted(leaves) == ["ani2x_pbe0xdm_0/ani2x_CH4", "ani2x_pbe0xdm_0/ani2x_H2O"]
 
 
 def test_species_to_atomic_numbers():
     assert list(species_to_atomic_numbers(np.array([b"H", b"C", b"O"]))) == [1, 6, 8]
-    assert list(species_to_atomic_numbers(np.array([1, 6, 8]))) == [1, 6, 8]
+    assert list(species_to_atomic_numbers(np.array([1, 6, 8], dtype=np.uint8))) == [1, 6, 8]
     nested = species_to_atomic_numbers(np.array([[b"H", b"C"], [b"O", b"H"]]))
     assert nested.tolist() == [[1, 6], [8, 1]]
 
 
 def test_discover_atomic_number_table(tmp_path):
-    path = _write_synthetic_dataset(tmp_path / "xdm.h5")
+    path = _write_wrapped_dataset(tmp_path / "xdm.h5")
     z_table = discover_atomic_number_table(str(path))
     assert z_table.zs == [1, 6, 8]
 
 
+def test_discover_atomic_number_table_species_key(tmp_path):
+    path = _write_wrapped_dataset(tmp_path / "xdm.h5")
+    # Symbol-based "species" key should give the same result as the
+    # integer "atomic_numbers" key (the fixture's two arrays agree).
+    z_table = discover_atomic_number_table(str(path), species_key="species")
+    assert z_table.zs == [1, 6, 8]
+
+
+def test_discover_molecule_names_multi_file(tmp_path):
+    path1 = _write_wrapped_dataset(tmp_path / "a.h5", wrapper_name="ani2x_pbe0xdm_0")
+    path2 = _write_wrapped_dataset(tmp_path / "b.h5", wrapper_name="ani2x_pbe0xdm_1")
+    names = discover_molecule_names([str(path1), str(path2)])
+    assert names == ["ani2x_CH4", "ani2x_H2O"]
+
+
 def test_compute_xdm_element_statistics(tmp_path):
-    path = _write_synthetic_dataset(tmp_path / "xdm.h5")
+    path = _write_wrapped_dataset(tmp_path / "xdm.h5")
     z_table = discover_atomic_number_table(str(path))
     stats = compute_xdm_element_statistics(str(path), z_table)
     assert stats["mean"].shape == (3, 4)
     assert stats["std"].shape == (3, 4)
-    # H atoms appear in both H2O (2 per conformer) and CH4 (4 per conformer)
     n_h = 2 * 6 + 4 * 5
     assert stats["counts"][z_table.z_to_index(1)] == n_h
     assert np.all(stats["std"] > 0)
 
 
-def test_xdm_hdf5_dataset(tmp_path):
-    path = _write_synthetic_dataset(tmp_path / "xdm.h5")
+def test_xdm_hdf5_dataset_single_file(tmp_path):
+    path = _write_wrapped_dataset(tmp_path / "xdm.h5")
     z_table = discover_atomic_number_table(str(path))
     dataset = XDMHDF5Dataset(str(path), z_table=z_table, r_max=5.0)
     assert len(dataset) == 6 + 5
@@ -81,13 +120,39 @@ def test_xdm_hdf5_dataset(tmp_path):
     assert batch.xdm_targets.shape[1] == 4
 
 
-def test_xdm_dataset_group_subset(tmp_path):
-    path = _write_synthetic_dataset(tmp_path / "xdm.h5")
+def test_xdm_hdf5_dataset_molecule_name_subset(tmp_path):
+    path = _write_wrapped_dataset(tmp_path / "xdm.h5")
     z_table = discover_atomic_number_table(str(path))
-    train_ds = XDMHDF5Dataset(str(path), z_table=z_table, r_max=5.0, groups=["H2O"])
-    valid_ds = XDMHDF5Dataset(str(path), z_table=z_table, r_max=5.0, groups=["CH4"])
+    train_ds = XDMHDF5Dataset(
+        str(path), z_table=z_table, r_max=5.0, molecule_names=["ani2x_H2O"]
+    )
+    valid_ds = XDMHDF5Dataset(
+        str(path), z_table=z_table, r_max=5.0, molecule_names=["ani2x_CH4"]
+    )
     assert len(train_ds) == 6
     assert len(valid_ds) == 5
+
+
+def test_xdm_hdf5_dataset_pools_conformers_across_files(tmp_path):
+    path1 = _write_wrapped_dataset(
+        tmp_path / "a.h5", wrapper_name="ani2x_pbe0xdm_0", n_conf_h2o=1, n_conf_ch4=1
+    )
+    path2 = _write_wrapped_dataset(
+        tmp_path / "b.h5", wrapper_name="ani2x_pbe0xdm_1", n_conf_h2o=1, n_conf_ch4=1
+    )
+    z_table = discover_atomic_number_table([str(path1), str(path2)])
+    dataset = XDMHDF5Dataset([str(path1), str(path2)], z_table=z_table, r_max=5.0)
+    # each file contributes 1 conformer per molecule; 2 molecules x 2 files
+    assert len(dataset) == 4
+
+    train_ds = XDMHDF5Dataset(
+        [str(path1), str(path2)],
+        z_table=z_table,
+        r_max=5.0,
+        molecule_names=["ani2x_H2O"],
+    )
+    # both files' H2O conformers should be pooled together
+    assert len(train_ds) == 2
 
 
 def _build_model(z_table, num_xdm_targets=4):
@@ -171,7 +236,7 @@ def test_atomic_xdm_mace_reference_roundtrip():
 
 
 def test_atomic_xdm_mace_training_step_reduces_loss(tmp_path):
-    path = _write_synthetic_dataset(tmp_path / "xdm.h5")
+    path = _write_wrapped_dataset(tmp_path / "xdm.h5")
     z_table = discover_atomic_number_table(str(path))
     stats = compute_xdm_element_statistics(str(path), z_table)
     dataset = XDMHDF5Dataset(str(path), z_table=z_table, r_max=5.0)

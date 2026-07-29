@@ -4,11 +4,11 @@
 ###########################################################################################
 
 import argparse
-import json
+import glob
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Dict, List
 
 import numpy as np
 import torch
@@ -18,6 +18,7 @@ from mace.data import (
     XDMHDF5Dataset,
     compute_xdm_element_statistics,
     discover_atomic_number_table,
+    discover_molecule_names,
 )
 from mace.modules import AtomicXDMMACE, gate_dict, interaction_classes
 from mace.modules.utils import compute_avg_num_neighbors
@@ -45,31 +46,44 @@ def build_parser() -> argparse.ArgumentParser:
 
     # Data
     parser.add_argument(
-        "--train_file", required=True, help="Path to the ANI-style HDF5 dataset."
+        "--train_files",
+        required=True,
+        nargs="+",
+        help="One or more ANI-style HDF5 files and/or glob patterns (e.g. "
+        "'data/pbe0xdm-ani2x_*.hdf5'), covering the training pool. The same "
+        "molecule name may appear in multiple files (e.g. successive "
+        "active-learning batches); their conformers are pooled together.",
     )
     parser.add_argument(
-        "--valid_file",
+        "--valid_files",
         default=None,
-        help="Optional separate HDF5 file for validation. If omitted, a fraction "
-        "of the molecular formula groups in --train_file is held out.",
+        nargs="+",
+        help="Optional separate HDF5 file(s)/glob(s) for validation. If "
+        "omitted, a fraction of the molecule names found across --train_files "
+        "is held out (by molecule identity, not by individual conformer, so "
+        "no molecule's conformers are split across train and valid).",
     )
     parser.add_argument(
         "--valid_fraction",
         type=float,
         default=0.1,
-        help="Fraction of formula groups held out for validation when "
-        "--valid_file is not given.",
+        help="Fraction of molecule names held out for validation when "
+        "--valid_files is not given.",
     )
     parser.add_argument(
         "--target_keys",
         nargs=4,
         default=list(DEFAULT_TARGET_KEYS),
         metavar=("M1_KEY", "M2_KEY", "M3_KEY", "VEFF_KEY"),
-        help="HDF5 dataset keys (within each formula group) for the four "
+        help="HDF5 dataset keys (within each molecule group) for the four "
         "per-atom XDM targets.",
     )
     parser.add_argument(
-        "--species_key", default="species", help="HDF5 key for atomic species."
+        "--species_key",
+        default="atomic_numbers",
+        help="HDF5 key for atomic species: an integer atomic-number array "
+        "(default 'atomic_numbers'), or an array of element symbols "
+        "(e.g. 'species').",
     )
     parser.add_argument(
         "--coordinates_key",
@@ -80,7 +94,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--atomic_numbers",
         default=None,
         help="Comma-separated list of atomic numbers, e.g. '1,6,7,8'. If omitted, "
-        "the set of elements is discovered from the training groups.",
+        "the set of elements is discovered from the training files.",
     )
 
     # Model hyperparameters
@@ -162,33 +176,39 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def resolve_z_table(args: argparse.Namespace) -> AtomicNumberTable:
+def expand_file_patterns(patterns: List[str]) -> List[str]:
+    files = []
+    for pattern in patterns:
+        matches = sorted(glob.glob(pattern))
+        if not matches:
+            raise FileNotFoundError(f"No files matched '{pattern}'")
+        files.extend(matches)
+    return files
+
+
+def resolve_z_table(args: argparse.Namespace, train_files: List[str]) -> AtomicNumberTable:
     if args.atomic_numbers is not None:
         zs = [int(z) for z in args.atomic_numbers.split(",")]
         return AtomicNumberTable(sorted(zs))
-    return discover_atomic_number_table(
-        args.train_file, species_key=args.species_key
-    )
+    return discover_atomic_number_table(train_files, species_key=args.species_key)
 
 
-def split_groups(args: argparse.Namespace) -> Dict[str, List[str]]:
-    import h5py
+def split_molecule_names(
+    args: argparse.Namespace, train_files: List[str], valid_files: List[str]
+) -> Dict[str, List[str]]:
+    all_names = discover_molecule_names(train_files)
 
-    with h5py.File(args.train_file, "r") as f:
-        all_groups = list(f.keys())
-
-    if args.valid_file is not None:
-        with h5py.File(args.valid_file, "r") as f:
-            valid_groups = list(f.keys())
-        return {"train": all_groups, "valid": valid_groups}
+    if args.valid_files is not None:
+        valid_names = discover_molecule_names(valid_files)
+        return {"train": all_names, "valid": valid_names}
 
     rng = np.random.RandomState(args.seed)
-    shuffled = list(all_groups)
+    shuffled = list(all_names)
     rng.shuffle(shuffled)
     n_valid = max(1, int(round(len(shuffled) * args.valid_fraction)))
-    valid_groups = shuffled[:n_valid]
-    train_groups = shuffled[n_valid:]
-    return {"train": train_groups, "valid": valid_groups}
+    valid_names = shuffled[:n_valid]
+    train_names = shuffled[n_valid:]
+    return {"train": train_names, "valid": valid_names}
 
 
 def batch_loss_and_metrics(
@@ -248,43 +268,50 @@ def main():
     device = init_device(args.device)
 
     target_keys = list(args.target_keys)
-    z_table = resolve_z_table(args)
+    train_files = expand_file_patterns(args.train_files)
+    valid_files = (
+        expand_file_patterns(args.valid_files) if args.valid_files is not None else None
+    )
+    logging.info(f"Training files: {len(train_files)}")
+    if valid_files is not None:
+        logging.info(f"Validation files: {len(valid_files)}")
+
+    z_table = resolve_z_table(args, train_files)
     logging.info(f"Atomic number table: {z_table}")
 
-    groups = split_groups(args)
+    names = split_molecule_names(args, train_files, valid_files)
     logging.info(
-        f"Training groups: {len(groups['train'])}, validation groups: {len(groups['valid'])}"
+        f"Training molecules: {len(names['train'])}, validation molecules: {len(names['valid'])}"
     )
 
     element_stats = compute_xdm_element_statistics(
-        args.train_file,
+        train_files,
         z_table=z_table,
         target_keys=target_keys,
         species_key=args.species_key,
         coordinates_key=args.coordinates_key,
-        groups=groups["train"],
+        molecule_names=names["train"],
     )
     logging.info(f"Per-element mean:\n{element_stats['mean']}")
     logging.info(f"Per-element std:\n{element_stats['std']}")
 
     train_dataset = XDMHDF5Dataset(
-        args.train_file,
+        train_files,
         z_table=z_table,
         r_max=args.r_max,
         target_keys=target_keys,
         species_key=args.species_key,
         coordinates_key=args.coordinates_key,
-        groups=groups["train"],
+        molecule_names=names["train"],
     )
-    valid_file = args.valid_file if args.valid_file is not None else args.train_file
     valid_dataset = XDMHDF5Dataset(
-        valid_file,
+        valid_files if valid_files is not None else train_files,
         z_table=z_table,
         r_max=args.r_max,
         target_keys=target_keys,
         species_key=args.species_key,
         coordinates_key=args.coordinates_key,
-        groups=groups["valid"],
+        molecule_names=names["valid"],
     )
     logging.info(
         f"Training conformers: {len(train_dataset)}, validation conformers: {len(valid_dataset)}"

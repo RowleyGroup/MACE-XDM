@@ -24,6 +24,8 @@ from .xdm import (
     build_xdm_atomic_data,
     compute_xdm_element_statistics,
     discover_atomic_number_table,
+    discover_molecule_names,
+    find_leaf_groups,
     species_to_atomic_numbers,
 )
 
@@ -52,5 +54,7 @@ __all__ = [
     "build_xdm_atomic_data",
     "compute_xdm_element_statistics",
     "discover_atomic_number_table",
+    "discover_molecule_names",
+    "find_leaf_groups",
     "species_to_atomic_numbers",
 ]
