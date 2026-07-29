@@ -5,10 +5,11 @@
 
 import argparse
 import glob
+import json
 import logging
 import time
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -17,8 +18,10 @@ from e3nn import o3
 from mace.data import (
     XDMHDF5Dataset,
     compute_xdm_element_statistics,
+    default_mlxdm_2x_atomic_number_table,
     discover_atomic_number_table,
     discover_molecule_names,
+    mlxdm_2x_reference_stats,
 )
 from mace.modules import AtomicXDMMACE, gate_dict, interaction_classes
 from mace.modules.utils import compute_avg_num_neighbors
@@ -69,6 +72,35 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.1,
         help="Fraction of molecule names held out for validation when "
         "--valid_files is not given.",
+    )
+    parser.add_argument(
+        "--test_files",
+        default=None,
+        nargs="+",
+        help="Optional separate HDF5 file(s)/glob(s) for a final held-out "
+        "test set. If omitted, a further fraction of the molecule names is "
+        "held out for testing (disjoint from both training and validation).",
+    )
+    parser.add_argument(
+        "--test_fraction",
+        type=float,
+        default=0.1,
+        help="Fraction of molecule names held out for testing when "
+        "--test_files is not given. This is a single merged file's typical "
+        "use case: pass one --train_files master file and let "
+        "--valid_fraction/--test_fraction carve out validation and test "
+        "molecules from it.",
+    )
+    parser.add_argument(
+        "--element_stats",
+        default="mlxdm_2x",
+        choices=["mlxdm_2x", "dataset"],
+        help="Source of the per-element mean/std used to standardize "
+        "targets. 'mlxdm_2x' (default) uses the fixed reference statistics "
+        "for H, C, N, O, S, F, Cl from RowleyGroup/MLXDM's ANI-2x dispersion "
+        "model (not computed from your training data). 'dataset' computes "
+        "mean/std from the training molecules instead, and is required for "
+        "elements outside that set of 7.",
     )
     parser.add_argument(
         "--target_keys",
@@ -168,6 +200,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--checkpoints_dir", default="checkpoints")
     parser.add_argument("--model_dir", default="models")
     parser.add_argument(
+        "--results_dir",
+        default="results",
+        help="Where to save the molecule-name train/valid/test split and "
+        "final test-set metrics, as JSON.",
+    )
+    parser.add_argument(
         "--restart_latest",
         action="store_true",
         help="Resume from checkpoints_dir/<name>_latest.pt if it exists.",
@@ -190,25 +228,54 @@ def resolve_z_table(args: argparse.Namespace, train_files: List[str]) -> AtomicN
     if args.atomic_numbers is not None:
         zs = [int(z) for z in args.atomic_numbers.split(",")]
         return AtomicNumberTable(sorted(zs))
+    if args.element_stats == "mlxdm_2x":
+        # Fixed to MLXDM's 7 supported elements; skips scanning every
+        # molecule in (potentially very large) --train_files for its elements.
+        return default_mlxdm_2x_atomic_number_table()
     return discover_atomic_number_table(train_files, species_key=args.species_key)
 
 
 def split_molecule_names(
-    args: argparse.Namespace, train_files: List[str], valid_files: List[str]
+    args: argparse.Namespace,
+    train_files: List[str],
+    valid_files: Optional[List[str]],
+    test_files: Optional[List[str]],
 ) -> Dict[str, List[str]]:
-    all_names = discover_molecule_names(train_files)
+    """Split molecule names into disjoint train/valid/test sets.
 
+    Explicit --valid_files/--test_files are used as-is (and removed from the
+    training pool); everything else is drawn by molecule identity from
+    --train_files, so a single merged file can be split into all three parts
+    at once via --valid_fraction/--test_fraction.
+    """
+    all_names = discover_molecule_names(train_files)
+    remaining = set(all_names)
+
+    valid_names: Optional[List[str]] = None
     if args.valid_files is not None:
         valid_names = discover_molecule_names(valid_files)
-        return {"train": all_names, "valid": valid_names}
+        remaining -= set(valid_names)
+
+    test_names: Optional[List[str]] = None
+    if args.test_files is not None:
+        test_names = discover_molecule_names(test_files)
+        remaining -= set(test_names)
 
     rng = np.random.RandomState(args.seed)
-    shuffled = list(all_names)
+    shuffled = sorted(remaining)
     rng.shuffle(shuffled)
-    n_valid = max(1, int(round(len(shuffled) * args.valid_fraction)))
-    valid_names = shuffled[:n_valid]
-    train_names = shuffled[n_valid:]
-    return {"train": train_names, "valid": valid_names}
+
+    if valid_names is None:
+        n_valid = max(1, int(round(len(all_names) * args.valid_fraction)))
+        valid_names = shuffled[:n_valid]
+        shuffled = shuffled[n_valid:]
+    if test_names is None:
+        n_test = max(1, int(round(len(all_names) * args.test_fraction)))
+        test_names = shuffled[:n_test]
+        shuffled = shuffled[n_test:]
+
+    train_names = shuffled
+    return {"train": train_names, "valid": valid_names, "test": test_names}
 
 
 def batch_loss_and_metrics(
@@ -261,6 +328,7 @@ def main():
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.checkpoints_dir).mkdir(parents=True, exist_ok=True)
     Path(args.model_dir).mkdir(parents=True, exist_ok=True)
+    Path(args.results_dir).mkdir(parents=True, exist_ok=True)
     setup_logger(level=logging.INFO, tag=args.name, directory=args.log_dir)
 
     set_seeds(args.seed)
@@ -272,26 +340,42 @@ def main():
     valid_files = (
         expand_file_patterns(args.valid_files) if args.valid_files is not None else None
     )
+    test_files = (
+        expand_file_patterns(args.test_files) if args.test_files is not None else None
+    )
     logging.info(f"Training files: {len(train_files)}")
     if valid_files is not None:
         logging.info(f"Validation files: {len(valid_files)}")
+    if test_files is not None:
+        logging.info(f"Test files: {len(test_files)}")
 
     z_table = resolve_z_table(args, train_files)
     logging.info(f"Atomic number table: {z_table}")
 
-    names = split_molecule_names(args, train_files, valid_files)
+    names = split_molecule_names(args, train_files, valid_files, test_files)
     logging.info(
-        f"Training molecules: {len(names['train'])}, validation molecules: {len(names['valid'])}"
+        f"Training molecules: {len(names['train'])}, "
+        f"validation molecules: {len(names['valid'])}, "
+        f"test molecules: {len(names['test'])}"
     )
+    with open(Path(args.results_dir) / f"{args.name}_split.json", "w", encoding="utf-8") as f:
+        json.dump(names, f, indent=2)
 
-    element_stats = compute_xdm_element_statistics(
-        train_files,
-        z_table=z_table,
-        target_keys=target_keys,
-        species_key=args.species_key,
-        coordinates_key=args.coordinates_key,
-        molecule_names=names["train"],
-    )
+    if args.element_stats == "mlxdm_2x":
+        element_stats = mlxdm_2x_reference_stats(z_table)
+        logging.info(
+            "Using fixed MLXDM ANI-2x reference mean/std (H, C, N, O, S, F, Cl), "
+            "not computed from the training data."
+        )
+    else:
+        element_stats = compute_xdm_element_statistics(
+            train_files,
+            z_table=z_table,
+            target_keys=target_keys,
+            species_key=args.species_key,
+            coordinates_key=args.coordinates_key,
+            molecule_names=names["train"],
+        )
     logging.info(f"Per-element mean:\n{element_stats['mean']}")
     logging.info(f"Per-element std:\n{element_stats['std']}")
 
@@ -313,8 +397,19 @@ def main():
         coordinates_key=args.coordinates_key,
         molecule_names=names["valid"],
     )
+    test_dataset = XDMHDF5Dataset(
+        test_files if test_files is not None else train_files,
+        z_table=z_table,
+        r_max=args.r_max,
+        target_keys=target_keys,
+        species_key=args.species_key,
+        coordinates_key=args.coordinates_key,
+        molecule_names=names["test"],
+    )
     logging.info(
-        f"Training conformers: {len(train_dataset)}, validation conformers: {len(valid_dataset)}"
+        f"Training conformers: {len(train_dataset)}, "
+        f"validation conformers: {len(valid_dataset)}, "
+        f"test conformers: {len(test_dataset)}"
     )
 
     train_loader = DataLoader(
@@ -326,6 +421,13 @@ def main():
     )
     valid_loader = DataLoader(
         valid_dataset,
+        batch_size=args.valid_batch_size,
+        shuffle=False,
+        drop_last=False,
+        num_workers=args.num_workers,
+    )
+    test_loader = DataLoader(
+        test_dataset,
         batch_size=args.valid_batch_size,
         shuffle=False,
         drop_last=False,
@@ -376,7 +478,7 @@ def main():
     best_path = Path(args.checkpoints_dir) / f"{args.name}_best.pt"
 
     if args.restart_latest and latest_path.exists():
-        checkpoint = torch.load(latest_path, map_location=device)
+        checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
@@ -447,6 +549,28 @@ def main():
     logging.info(f"Training complete. Best validation loss: {best_valid_loss:.6f}")
     logging.info(f"Best model checkpoint: {best_path}")
     logging.info(f"Best full model: {Path(args.model_dir) / f'{args.name}.model'}")
+
+    best_checkpoint = torch.load(best_path, map_location=device, weights_only=False)
+    model.load_state_dict(best_checkpoint["model_state_dict"])
+    test_metrics = evaluate(model, test_loader, device, loss_weights, len(target_keys))
+    test_mae_str = ", ".join(
+        f"{key}_mae={test_metrics[f'mae_{i}']:.4f}" for i, key in enumerate(target_keys)
+    )
+    logging.info(f"Test loss={test_metrics['loss']:.6f}, {test_mae_str}")
+    with open(Path(args.results_dir) / f"{args.name}_test_metrics.json", "w", encoding="utf-8") as f:
+        json.dump(
+            {
+                "target_keys": target_keys,
+                **{
+                    f"{key}_{metric}": test_metrics[f"{metric}_{i}"]
+                    for i, key in enumerate(target_keys)
+                    for metric in ("mae", "rmse")
+                },
+                "loss": test_metrics["loss"],
+            },
+            f,
+            indent=2,
+        )
 
 
 if __name__ == "__main__":

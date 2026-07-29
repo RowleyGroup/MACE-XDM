@@ -189,10 +189,17 @@ extensive total like energy), the model reads out `num_xdm_targets` (default 4)
 `0e` scalars per atom instead of a single energy.
 
 Predictions are made in per-element standardized (z-score) units: for each
-chemical element, the mean and standard deviation of each target property are
-computed from the training set, and the network predicts the standardized
-residual. This is handled by `AtomicElementReferenceBlock`, which maps back to
-physical units via `physical = mean[Z] + std[Z] * standardized`.
+chemical element, the network predicts a standardized residual, which is
+mapped back to physical units by `AtomicElementReferenceBlock` via
+`physical = mean[Z] + std[Z] * standardized` — the same convention as MLXDM's
+own `Shifter` module (`b0 + b1 * x`, with `b0`/`b1` the per-element mean/std).
+By default (`--element_stats=mlxdm_2x`), these mean/std values are *not*
+computed from your training data — they're the fixed reference statistics for
+H, C, N, O, S, F, Cl taken directly from RowleyGroup/MLXDM's ANI-2x dispersion
+model (`torchanipbe0/resources/dispersion_2x/{m1,m2,m3,v}/best.param`), so a
+model trained this way standardizes targets exactly the way MLXDM does. Pass
+`--element_stats=dataset` to instead compute mean/std from your own training
+molecules (required if your dataset includes elements outside that set of 7).
 
 ### Dataset format
 
@@ -225,13 +232,15 @@ all of their conformers are pooled together under that molecule name.
 
 ### Training
 
-Pass one or more files and/or glob patterns via `--train_files` to cover a
-whole directory of per-batch HDF5 files:
+Pass one or more files and/or glob patterns via `--train_files` — either many
+per-batch files (`"data/pbe0xdm-ani2x_*.hdf5"`) or a single merged master
+file:
 
 ```sh
 mace_run_train_xdm \
-    --train_files "data/pbe0xdm-ani2x_*.hdf5" \
+    --train_files "deshaw_350k_pbe0xdm.hdf5" \
     --valid_fraction=0.1 \
+    --test_fraction=0.1 \
     --r_max=5.0 \
     --hidden_irreps="128x0e + 128x1o" \
     --num_interactions=2 \
@@ -240,12 +249,22 @@ mace_run_train_xdm \
     --name="xdm_model"
 ```
 
-Validation is a held-out set of molecule names (not individual conformers),
-so a validation molecule's conformers are never seen during training, even
-across different files. Per-element mean/std statistics used for
-standardization are computed from the training molecules only and stored in
-the checkpoint. The best model (lowest validation loss) is saved to
-`<model_dir>/<name>.model`, ready for evaluation or downstream use.
+`--train_files` is split three ways **by molecule identity** (not individual
+conformers): `--valid_fraction` and `--test_fraction` of the molecule names
+are held out for validation and testing respectively, so no molecule's
+conformers are ever split across train/valid/test, even when the same
+molecule's conformers are spread across several files. Validation drives
+model selection and early stopping during training; the test set is only
+touched once, after training, using the best checkpoint. Pass
+`--valid_files`/`--test_files` instead to use separate files for either split
+rather than carving them out of `--train_files`.
+
+The resulting split (molecule names per set) is saved to
+`<results_dir>/<name>_split.json`, and final test-set MAE/RMSE per property to
+`<results_dir>/<name>_test_metrics.json`. Per-element statistics used for
+standardization (see above) are stored in the checkpoint regardless of source.
+The best model (lowest validation loss) is saved to `<model_dir>/<name>.model`,
+ready for evaluation or downstream use.
 
 ### Evaluation
 
