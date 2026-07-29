@@ -577,6 +577,11 @@ def main():
             indent=2,
         )
 
+    # Written only on normal completion (max_num_epochs reached or early
+    # stopping), never on a mid-loop kill (e.g. SLURM walltime) -- a chained
+    # job script can check for this file to decide whether to resubmit.
+    (Path(args.results_dir) / f"{args.name}_DONE").touch()
+
 
 if __name__ == "__main__":
     main()
