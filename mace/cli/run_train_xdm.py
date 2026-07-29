@@ -520,7 +520,11 @@ def main():
             metrics = evaluate(
                 model, valid_loader, device, loss_weights, len(target_keys)
             )
+            lr_before = optimizer.param_groups[0]["lr"]
             scheduler.step(metrics["loss"])
+            lr_after = optimizer.param_groups[0]["lr"]
+            if lr_after < lr_before:
+                logging.info(f"Reducing learning rate: {lr_before:.3e} -> {lr_after:.3e}")
             elapsed = time.time() - epoch_start
             mae_str = ", ".join(
                 f"{key}_mae={metrics[f'mae_{i}']:.4f}"
@@ -528,7 +532,8 @@ def main():
             )
             logging.info(
                 f"Epoch {epoch}: train_loss={train_loss:.6f}, "
-                f"valid_loss={metrics['loss']:.6f}, {mae_str}, time={elapsed:.1f}s"
+                f"valid_loss={metrics['loss']:.6f}, {mae_str}, lr={lr_after:.3e}, "
+                f"time={elapsed:.1f}s"
             )
 
             save_checkpoint(latest_path, epoch)
