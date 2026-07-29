@@ -1395,3 +1395,54 @@ class ScaleShiftBlock(torch.nn.Module):
             else f"{self.shift.item():.4f}"
         )
         return f"{self.__class__.__name__}(scale={formatted_scale}, shift={formatted_shift})"
+
+
+@compile_mode("script")
+class AtomicElementReferenceBlock(torch.nn.Module):
+    """Per-element, per-property z-score reference.
+
+    Generalizes AtomicEnergiesBlock/ScaleShiftBlock from a single scalar (energy)
+    to several simultaneous per-atom target properties (e.g. XDM's M1, M2, M3,
+    Veff): each chemical element has its own mean and std for each property,
+    computed from the training set. The network predicts the standardized
+    (z-scored) residual and this block maps it back to physical units:
+        physical = mean[Z] + std[Z] * standardized
+    """
+
+    mean: torch.Tensor
+    std: torch.Tensor
+
+    def __init__(
+        self,
+        mean: Union[np.ndarray, torch.Tensor],
+        std: Union[np.ndarray, torch.Tensor],
+    ):
+        super().__init__()
+        mean_t = torch.as_tensor(mean, dtype=torch.get_default_dtype())
+        std_t = torch.as_tensor(std, dtype=torch.get_default_dtype())
+        assert mean_t.shape == std_t.shape
+        assert mean_t.dim() == 2  # [n_elements, n_properties]
+        self.register_buffer("mean", mean_t)
+        self.register_buffer("std", std_t)
+
+    def forward(
+        self, standardized: torch.Tensor, node_attrs: torch.Tensor
+    ) -> torch.Tensor:
+        # node_attrs: one-hot element indicator [n_nodes, n_elements]
+        mean = torch.matmul(node_attrs, self.mean.to(dtype=node_attrs.dtype))
+        std = torch.matmul(node_attrs, self.std.to(dtype=node_attrs.dtype))
+        return mean + std * standardized
+
+    def standardize(
+        self, physical: torch.Tensor, node_attrs: torch.Tensor
+    ) -> torch.Tensor:
+        mean = torch.matmul(node_attrs, self.mean.to(dtype=node_attrs.dtype))
+        std = torch.matmul(node_attrs, self.std.to(dtype=node_attrs.dtype))
+        return (physical - mean) / std
+
+    def __repr__(self):
+        n_elements, n_properties = self.mean.shape
+        return (
+            f"{self.__class__.__name__}(n_elements={n_elements}, "
+            f"n_properties={n_properties})"
+        )

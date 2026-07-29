@@ -3,6 +3,7 @@ from typing import Callable, Dict, Optional, Type
 import torch
 
 from .blocks import (
+    AtomicElementReferenceBlock,
     AtomicEnergiesBlock,
     EquivariantProductBasisBlock,
     GeneralNonLinearBiasReadoutBlock,
@@ -42,6 +43,7 @@ from .models import (
     MACE,
     AtomicDielectricMACE,
     AtomicDipolesMACE,
+    AtomicXDMMACE,
     EnergyDipolesMACE,
     ScaleShiftMACE,
 )
@@ -91,6 +93,7 @@ gate_dict: Dict[str, Optional[Callable]] = {
 
 __all__ = [
     "AtomicEnergiesBlock",
+    "AtomicElementReferenceBlock",
     "RadialEmbeddingBlock",
     "ZBLBasis",
     "LinearNodeEmbeddingBlock",
@@ -110,6 +113,7 @@ __all__ = [
     "ScaleShiftMACE",
     "AtomicDipolesMACE",
     "AtomicDielectricMACE",
+    "AtomicXDMMACE",
     "EnergyDipolesMACE",
     "PolarMACE",
     "WeightedEnergyForcesLoss",

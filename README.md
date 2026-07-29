@@ -19,6 +19,7 @@
   - [Usage](#usage)
     - [Training](#training)
     - [Evaluation](#evaluation)
+  - [XDM Atomic Coefficient Prediction](#xdm-atomic-coefficient-prediction)
   - [Tutorials](#tutorials)
   - [CUDA acceleration with cuEquivariance](#cuda-acceleration-with-cuequivariance)
   - [Weights and Biases for experiment tracking](#weights-and-biases-for-experiment-tracking)
@@ -42,6 +43,10 @@ MACE provides fast and accurate machine learning interatomic potentials with hig
 
 This repository contains the MACE reference implementation developed by
 Ilyes Batatia, Gregor Simm, David Kovacs, and the group of Gabor Csanyi, and friends (see Contributors).
+
+This fork (MACE-XDM) additionally vendors an extension for predicting per-atom
+XDM dispersion coefficients (M1, M2, M3, Veff); see
+[XDM Atomic Coefficient Prediction](#xdm-atomic-coefficient-prediction) below.
 
 Also available:
 
@@ -168,6 +173,76 @@ mace_eval_configs \
     --configs="your_configs.xyz" \
     --model="your_model.model" \
     --output="./your_output.xyz"
+```
+
+## XDM Atomic Coefficient Prediction
+
+This fork adds `AtomicXDMMACE`, a MACE variant that predicts per-atom
+[XDM](https://en.wikipedia.org/wiki/Van_der_Waals_correction#Exchange-hole_dipole_moment_model)
+dispersion coefficients — the moments M1, M2, M3 and the effective volume
+Veff — directly from atomic structure, using the same equivariant
+message-passing body as MACE's energy models (following the ANI symmetry-function
+approach used in [MLXDM](https://github.com/RowleyGroup/MLXDM), but with MACE's
+higher-order equivariant features in place of ANI's radial/angular symmetry
+functions). Because M1/M2/M3/Veff are invariant per-atom scalars (not an
+extensive total like energy), the model reads out `num_xdm_targets` (default 4)
+`0e` scalars per atom instead of a single energy.
+
+Predictions are made in per-element standardized (z-score) units: for each
+chemical element, the mean and standard deviation of each target property are
+computed from the training set, and the network predicts the standardized
+residual. This is handled by `AtomicElementReferenceBlock`, which maps back to
+physical units via `physical = mean[Z] + std[Z] * standardized`.
+
+### Dataset format
+
+Training data is expected as an ANI-style HDF5 file: one group per molecular
+formula, with conformers batched together within each group.
+
+```
+/<formula>/species       [n_atoms] or [n_conf, n_atoms]   (atomic numbers or element symbols)
+/<formula>/coordinates   [n_conf, n_atoms, 3]              (Angstrom)
+/<formula>/M1            [n_conf, n_atoms]
+/<formula>/M2            [n_conf, n_atoms]
+/<formula>/M3            [n_conf, n_atoms]
+/<formula>/Veff          [n_conf, n_atoms]
+```
+
+Key names (`species`, `coordinates`, `M1`, `M2`, `M3`, `Veff`) can be
+overridden with `--species_key`, `--coordinates_key`, and `--target_keys` if
+your file uses different names.
+
+### Training
+
+```sh
+mace_run_train_xdm \
+    --train_file="your_xdm_dataset.h5" \
+    --valid_fraction=0.1 \
+    --r_max=5.0 \
+    --hidden_irreps="128x0e + 128x1o" \
+    --num_interactions=2 \
+    --batch_size=32 \
+    --max_num_epochs=200 \
+    --name="xdm_model"
+```
+
+Validation is a held-out set of molecular formula groups (not individual
+conformers), so validation molecules are never seen during training even
+across conformers. Per-element mean/std statistics used for standardization
+are computed from the training groups only and stored in the checkpoint. The
+best model (lowest validation loss) is saved to
+`<model_dir>/<name>.model`, ready for evaluation or downstream use.
+
+### Evaluation
+
+To run a trained model on new structures (any ASE-readable format) and
+write the predicted per-atom coefficients back out as extended XYZ arrays:
+
+```sh
+mace_eval_xdm \
+    --model="xdm_model.model" \
+    --configs="your_configs.xyz" \
+    --output="your_output.xyz"
 ```
 
 ## Tutorials

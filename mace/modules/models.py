@@ -17,6 +17,7 @@ from mace.tools.scatter import scatter_mean, scatter_sum
 from mace.tools.torch_tools import get_change_of_basis, spherical_to_cartesian
 
 from .blocks import (
+    AtomicElementReferenceBlock,
     AtomicEnergiesBlock,
     EquivariantProductBasisBlock,
     InteractionBlock,
@@ -1429,3 +1430,189 @@ class EnergyDipolesMACE(torch.nn.Module):
             "atomic_dipoles": atomic_dipoles,
         }
         return output
+
+
+@compile_mode("script")
+class AtomicXDMMACE(torch.nn.Module):
+    """MACE body with a readout for per-atom XDM dispersion coefficients.
+
+    Predicts, for every atom, the exchange-hole dipole moment (XDM) moments
+    M1, M2, M3 and effective volume Veff (or any fixed-size set of per-atom
+    scalar properties, see ``num_xdm_targets``). Structurally this mirrors
+    ``AtomicDipolesMACE``: the same interaction/product-basis body, but the
+    per-layer readouts emit ``num_xdm_targets`` invariant (0e) scalars per atom
+    instead of an l=1 dipole vector, and their per-layer contributions are
+    summed the same way atomic energies are summed in the base ``MACE`` model.
+
+    The raw summed readout is a per-element standardized (z-scored) residual;
+    ``xdm_reference`` (an ``AtomicElementReferenceBlock``) holds the per-element
+    mean/std of each target computed from the training set and maps the
+    residual back to physical units: ``physical = mean[Z] + std[Z] * residual``.
+    """
+
+    def __init__(
+        self,
+        r_max: float,
+        num_bessel: int,
+        num_polynomial_cutoff: int,
+        max_ell: int,
+        interaction_cls: Type[InteractionBlock],
+        interaction_cls_first: Type[InteractionBlock],
+        num_interactions: int,
+        num_elements: int,
+        hidden_irreps: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        avg_num_neighbors: float,
+        atomic_numbers: List[int],
+        correlation: int,
+        gate: Optional[Callable],
+        element_means: Union[np.ndarray, torch.Tensor],  # [n_elements, num_xdm_targets]
+        element_stds: Union[np.ndarray, torch.Tensor],  # [n_elements, num_xdm_targets]
+        num_xdm_targets: int = 4,
+        radial_type: Optional[str] = "bessel",
+        radial_MLP: Optional[List[int]] = None,
+    ):
+        super().__init__()
+        self.register_buffer(
+            "atomic_numbers", torch.tensor(atomic_numbers, dtype=torch.int64)
+        )
+        self.register_buffer("r_max", torch.tensor(r_max, dtype=torch.float64))
+        self.register_buffer(
+            "num_interactions", torch.tensor(num_interactions, dtype=torch.int64)
+        )
+        self.num_xdm_targets = num_xdm_targets
+
+        # Embedding
+        node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
+        node_feats_irreps = o3.Irreps([(hidden_irreps.count(o3.Irrep(0, 1)), (0, 1))])
+        self.node_embedding = LinearNodeEmbeddingBlock(
+            irreps_in=node_attr_irreps, irreps_out=node_feats_irreps
+        )
+        self.radial_embedding = RadialEmbeddingBlock(
+            r_max=r_max,
+            num_bessel=num_bessel,
+            num_polynomial_cutoff=num_polynomial_cutoff,
+            radial_type=radial_type,
+        )
+        edge_feats_irreps = o3.Irreps(f"{self.radial_embedding.out_dim}x0e")
+
+        sh_irreps = o3.Irreps.spherical_harmonics(max_ell)
+        num_features = hidden_irreps.count(o3.Irrep(0, 1))
+        interaction_irreps = (sh_irreps * num_features).sort()[0].simplify()
+        self.spherical_harmonics = o3.SphericalHarmonics(
+            sh_irreps, normalize=True, normalization="component"
+        )
+        if radial_MLP is None:
+            radial_MLP = [64, 64, 64]
+
+        readout_irreps = o3.Irreps(f"{num_xdm_targets}x0e")
+
+        # Interactions and readouts
+        inter = interaction_cls_first(
+            node_attrs_irreps=node_attr_irreps,
+            node_feats_irreps=node_feats_irreps,
+            edge_attrs_irreps=sh_irreps,
+            edge_feats_irreps=edge_feats_irreps,
+            target_irreps=interaction_irreps,
+            hidden_irreps=hidden_irreps,
+            avg_num_neighbors=avg_num_neighbors,
+            radial_MLP=radial_MLP,
+        )
+        self.interactions = torch.nn.ModuleList([inter])
+
+        use_sc_first = False
+        if "Residual" in str(interaction_cls_first):
+            use_sc_first = True
+
+        node_feats_irreps_out = inter.target_irreps
+        prod = EquivariantProductBasisBlock(
+            node_feats_irreps=node_feats_irreps_out,
+            target_irreps=hidden_irreps,
+            correlation=correlation,
+            num_elements=num_elements,
+            use_sc=use_sc_first,
+        )
+        self.products = torch.nn.ModuleList([prod])
+
+        self.readouts = torch.nn.ModuleList()
+        self.readouts.append(LinearReadoutBlock(hidden_irreps, readout_irreps))
+
+        for i in range(num_interactions - 1):
+            inter = interaction_cls(
+                node_attrs_irreps=node_attr_irreps,
+                node_feats_irreps=hidden_irreps,
+                edge_attrs_irreps=sh_irreps,
+                edge_feats_irreps=edge_feats_irreps,
+                target_irreps=interaction_irreps,
+                hidden_irreps=hidden_irreps,
+                avg_num_neighbors=avg_num_neighbors,
+                radial_MLP=radial_MLP,
+            )
+            self.interactions.append(inter)
+            prod = EquivariantProductBasisBlock(
+                node_feats_irreps=interaction_irreps,
+                target_irreps=hidden_irreps,
+                correlation=correlation,
+                num_elements=num_elements,
+                use_sc=True,
+            )
+            self.products.append(prod)
+            if i == num_interactions - 2:
+                self.readouts.append(
+                    NonLinearReadoutBlock(
+                        hidden_irreps, MLP_irreps, gate, irrep_out=readout_irreps
+                    )
+                )
+            else:
+                self.readouts.append(LinearReadoutBlock(hidden_irreps, readout_irreps))
+
+        self.xdm_reference = AtomicElementReferenceBlock(element_means, element_stds)
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,  # pylint: disable=W0613
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        # Embeddings
+        node_feats = self.node_embedding(data["node_attrs"])
+        vectors, lengths = get_edge_vectors_and_lengths(
+            positions=data["positions"],
+            edge_index=data["edge_index"],
+            shifts=data["shifts"],
+        )
+        edge_attrs = self.spherical_harmonics(vectors)
+        edge_feats, cutoff = self.radial_embedding(
+            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+        )
+
+        # Interactions
+        contributions = []
+        for interaction, product, readout in zip(
+            self.interactions, self.products, self.readouts
+        ):
+            node_feats, sc = interaction(
+                node_attrs=data["node_attrs"],
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                edge_index=data["edge_index"],
+                cutoff=cutoff,
+            )
+            node_feats = product(
+                node_feats=node_feats,
+                sc=sc,
+                node_attrs=data["node_attrs"],
+            )
+            contributions.append(
+                readout(node_feats).view(-1, self.num_xdm_targets)
+            )  # [n_nodes, num_xdm_targets]
+
+        xdm_standardized = torch.sum(
+            torch.stack(contributions, dim=-1), dim=-1
+        )  # [n_nodes, num_xdm_targets]
+        xdm_atomic = self.xdm_reference(xdm_standardized, data["node_attrs"])
+
+        return {
+            "xdm_standardized": xdm_standardized,
+            "xdm_atomic": xdm_atomic,
+        }

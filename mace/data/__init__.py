@@ -19,6 +19,13 @@ from .utils import (
     test_config_types,
     update_keyspec_from_kwargs,
 )
+from .xdm import (
+    XDMHDF5Dataset,
+    build_xdm_atomic_data,
+    compute_xdm_element_statistics,
+    discover_atomic_number_table,
+    species_to_atomic_numbers,
+)
 
 __all__ = [
     "get_neighborhood",
@@ -41,4 +48,9 @@ __all__ = [
     "update_keyspec_from_kwargs",
     "LMDBDataset",
     "build_fake_padding_graph",
+    "XDMHDF5Dataset",
+    "build_xdm_atomic_data",
+    "compute_xdm_element_statistics",
+    "discover_atomic_number_table",
+    "species_to_atomic_numbers",
 ]
