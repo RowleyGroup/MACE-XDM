@@ -286,6 +286,30 @@ after training on a GPU also works out of the box, working around an
 e3nn<=0.4.x quirk where its internal `torch.jit.load` call doesn't forward
 `map_location` (see `mace.tools.safe_jit_load_map_location`/`load_full_model`).
 
+### Checking whether a model (including one still training) is any good
+
+`mace_test_xdm` evaluates a checkpoint on held-out data and reports overall
+and per-element MAE/RMSE/R² for each property, a comparison against the
+naive "always predict the fixed per-element reference mean" baseline (a
+`skill` near 0 means the network isn't beating that prior; closer to 1 is
+better), and a predicted-vs-true scatter plot -- useful for sanity-checking
+a model whose training hasn't finished yet, not just the final one:
+
+```sh
+mace_test_xdm \
+    --model="checkpoints/xdm_model_best.pt" \
+    --test_files="your_xdm_dataset.h5" \
+    --split_file="results/xdm_model_split.json" \
+    --output_dir="test_results"
+```
+
+`--split_file` (the file `mace_run_train_xdm` writes automatically) restricts
+evaluation to exactly the molecules held out as the test set, so results
+reflect true generalization rather than partly re-scoring training data;
+omitting it evaluates every molecule in `--test_files` instead. Add
+`--max_conformers 20000` to get a quick read on a very large dataset without
+waiting to score the whole thing.
+
 ### Adding XDM dispersion energy to a short-range MACE potential
 
 `MACEXDMDispersion` (`mace.modules`) combines a short-range MACE energy model
