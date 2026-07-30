@@ -165,6 +165,14 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--valid_batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-2)
     parser.add_argument("--weight_decay", type=float, default=5e-7)
+    parser.add_argument(
+        "--clip_grad_norm",
+        type=float,
+        default=None,
+        help="If set, clip gradient norm to this value before each optimizer "
+        "step (e.g. 10.0). Off by default; guards against a single outlier "
+        "batch destabilizing training on very large/noisy datasets.",
+    )
     parser.add_argument("--max_num_epochs", type=int, default=200)
     parser.add_argument(
         "--patience",
@@ -451,6 +459,8 @@ def main():
         element_stds=element_stats["std"],
     ).to(device)
     logging.info(f"Number of parameters: {count_parameters(model)}")
+    if args.clip_grad_norm is not None:
+        logging.info(f"Gradient norm clipping enabled at {args.clip_grad_norm}")
 
     optimizer = torch.optim.Adam(
         model.parameters(), lr=args.lr, weight_decay=args.weight_decay
@@ -502,6 +512,8 @@ def main():
             optimizer.zero_grad()
             loss, _, _ = batch_loss_and_metrics(model, batch, device, loss_weights)
             loss.backward()
+            if args.clip_grad_norm is not None:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), args.clip_grad_norm)
             optimizer.step()
             n_atoms = batch.node_attrs.shape[0]
             train_loss += loss.item() * n_atoms
