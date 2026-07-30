@@ -40,6 +40,38 @@ MLXDM_2X_STD: Dict[str, Dict[str, float]] = {
     "Cl": {"M1": 0.850317483, "M2": 14.66876091, "M3": 279.588133, "Veff": 3.083419526},
 }
 
+# Free-atom reference static dipole polarizability (alpha_free) and free-atom
+# volume (V_free), both in atomic units, transcribed from the constructor
+# arguments of RowleyGroup/MLXDM's torchanipbe0/models.py::XDM_2x_CC (the
+# DispersionLayer for this same H/C/N/O/S/F/Cl ANI-2x element set). Atom-in-
+# molecule polarizability is alpha_A = Veff_A * alpha_free_A / V_free_A.
+MLXDM_2X_ALPHA_FREE: Dict[str, float] = {
+    "H": 4.4997895,
+    "C": 11.87706887,
+    "N": 7.42316804,
+    "O": 5.41216434,
+    "S": 19.57017029,
+    "F": 3.75882236,
+    "Cl": 14.71136939,
+}
+
+MLXDM_2X_V_FREE: Dict[str, float] = {
+    "H": 8.2794385587230224,
+    "C": 35.403450375407488,
+    "N": 26.774856262986901,
+    "O": 22.577665436425793,
+    "S": 75.344227406670839,
+    "F": 18.604506038051770,
+    "Cl": 65.219744182377752,
+}
+
+# Becke-Johnson damping parameters (a1, a2) fitted for this PBE0-XDM/ANI-2x
+# combination, and the dispersion-sum cutoff radius (Angstrom), both from the
+# same XDM_2x_CC constructor call.
+MLXDM_2X_BJ_A1 = 0.4186
+MLXDM_2X_BJ_A2 = 2.6791
+MLXDM_2X_DISPERSION_CUTOFF = 14.0
+
 MLXDM_2X_ATOMIC_NUMBERS = sorted(ase_atomic_numbers[s] for s in MLXDM_2X_MEAN)
 
 _Z_TO_SYMBOL = {ase_atomic_numbers[s]: s for s in MLXDM_2X_MEAN}
@@ -90,3 +122,24 @@ def mlxdm_2x_reference_stats(
             mean[idx, j] = MLXDM_2X_MEAN[symbol][key]
             std[idx, j] = MLXDM_2X_STD[symbol][key]
     return {"mean": mean, "std": std}
+
+
+def mlxdm_2x_polarizability_reference(z_table: AtomicNumberTable) -> Dict[str, np.ndarray]:
+    """Build ``alpha_free``/``v_free`` arrays of shape ``[len(z_table)]`` from
+    MLXDM's fixed free-atom reference polarizability/volume, ready to feed
+    into an XDM dispersion-energy module (atom-in-molecule polarizability is
+    then ``alpha_A = Veff_A * alpha_free[Z] / v_free[Z]``).
+    """
+    missing = [z for z in z_table.zs if z not in _Z_TO_SYMBOL]
+    if missing:
+        raise ValueError(
+            f"MLXDM ANI-2x free-atom polarizability/volume reference values are "
+            f"only available for atomic numbers {MLXDM_2X_ATOMIC_NUMBERS} "
+            f"(H, C, N, O, S, F, Cl); no reference values for atomic numbers "
+            f"{missing}."
+        )
+    alpha_free = np.array(
+        [MLXDM_2X_ALPHA_FREE[_Z_TO_SYMBOL[z]] for z in z_table.zs]
+    )
+    v_free = np.array([MLXDM_2X_V_FREE[_Z_TO_SYMBOL[z]] for z in z_table.zs])
+    return {"alpha_free": alpha_free, "v_free": v_free}

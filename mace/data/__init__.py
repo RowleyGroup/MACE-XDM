@@ -30,7 +30,11 @@ from .xdm import (
 )
 from .xdm_mlxdm2x_stats import (
     MLXDM_2X_ATOMIC_NUMBERS,
+    MLXDM_2X_BJ_A1,
+    MLXDM_2X_BJ_A2,
+    MLXDM_2X_DISPERSION_CUTOFF,
     default_mlxdm_2x_atomic_number_table,
+    mlxdm_2x_polarizability_reference,
     mlxdm_2x_reference_stats,
 )
 
@@ -63,6 +67,10 @@ __all__ = [
     "find_leaf_groups",
     "species_to_atomic_numbers",
     "MLXDM_2X_ATOMIC_NUMBERS",
+    "MLXDM_2X_BJ_A1",
+    "MLXDM_2X_BJ_A2",
+    "MLXDM_2X_DISPERSION_CUTOFF",
     "default_mlxdm_2x_atomic_number_table",
+    "mlxdm_2x_polarizability_reference",
     "mlxdm_2x_reference_stats",
 ]

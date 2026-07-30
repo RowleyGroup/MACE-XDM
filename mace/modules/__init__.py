@@ -59,6 +59,8 @@ from .utils import (
     compute_rms_dipoles,
     compute_statistics,
 )
+from .xdm_combined import MACEXDMDispersion
+from .xdm_dispersion import XDMDispersionEnergy
 
 interaction_classes: Dict[str, Type[InteractionBlock]] = {
     "RealAgnosticResidualInteractionBlock": RealAgnosticResidualInteractionBlock,
@@ -114,6 +116,8 @@ __all__ = [
     "AtomicDipolesMACE",
     "AtomicDielectricMACE",
     "AtomicXDMMACE",
+    "XDMDispersionEnergy",
+    "MACEXDMDispersion",
     "EnergyDipolesMACE",
     "PolarMACE",
     "WeightedEnergyForcesLoss",

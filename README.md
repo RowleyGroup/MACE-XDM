@@ -278,6 +278,68 @@ mace_eval_xdm \
     --output="your_output.xyz"
 ```
 
+### Adding XDM dispersion energy to a short-range MACE potential
+
+`MACEXDMDispersion` (`mace.modules`) combines a short-range MACE energy model
+(trained on dispersion-deficient reference energies, e.g. bare PBE0) with a
+trained `AtomicXDMMACE` to give a total potential:
+
+```
+E_total = E_short_range(structure) + E_dispersion(XDM)
+```
+
+This mirrors RowleyGroup/MLXDM's own `ANIDispersion` module, which is a plain
+sum of an ANI backbone's energy and a dispersion model's energy -- the
+standard DFT+D-style recipe. The two sub-models are trained completely
+independently and may use different element orderings; `MACEXDMDispersion`
+reconciles them automatically.
+
+The dispersion energy itself (`XDMDispersionEnergy`) implements the
+Becke-Johnson-damped XDM combining rules exactly as used by MLXDM's ANI-2x
+dispersion model, transcribed from its source
+(`torchanipbe0/dispersion/nn.py`, `torchanipbe0/models.py`):
+
+```
+alpha_A   = Veff_A * alpha_free[Z_A] / v_free[Z_A]
+C6_AB     = M1_A*M1_B / (M1_A/alpha_A + M1_B/alpha_B)
+C8_AB     = 1.5*(M1_A*M2_B + M1_B*M2_A) / (M1_A/alpha_A + M1_B/alpha_B)
+C10_AB    = 2*(M1_A*M3_B + M3_A*M1_B + 2.1*M2_A*M2_B) / (M1_A/alpha_A + M1_B/alpha_B)
+R_crit,AB = (sqrt(C8/C6) + (C10/C6)^0.25 + sqrt(C10/C8)) / 3        (bohr)
+R_vdw,AB  = a2 + a1 * R_crit,AB * 0.529177249                        (Angstrom)
+E_disp    = -sum_pairs sum_{n=6,8,10}  C_n,AB / (r_AB^n + R_vdw,AB^n) * 0.529177249^n
+```
+
+with `alpha_free`/`v_free` (free-atom polarizability/volume) and the
+damping parameters `a1=0.4186, a2=2.6791` defaulting to MLXDM's fixed
+ANI-2x/PBE0-XDM values for H, C, N, O, S, F, Cl
+(`mace.data.mlxdm_2x_polarizability_reference`). The dispersion sum uses a
+dense pairwise distance matrix over whole (finite, non-periodic) molecules
+rather than a fixed-radius neighbor list, masked by a 14 Angstrom cutoff by
+default -- appropriate since dispersion decays slowly and this cutoff is much
+larger than a typical short-range MACE cutoff.
+
+Use the combined potential as an ASE calculator:
+
+```python
+from ase import Atoms
+from mace.calculators import MACEXDMDispersionCalculator
+
+calc = MACEXDMDispersionCalculator(
+    short_range_model_path="short_range_pbe0.model",
+    xdm_model_path="xdm_model.model",
+    device="cpu",
+)
+atoms = Atoms(...)
+atoms.calc = calc
+energy = atoms.get_potential_energy()
+forces = atoms.get_forces()
+```
+
+Forces are computed by autograd through the whole combined energy (both
+sub-models' contributions), not by adding separately-computed forces, so
+they are exact for the combined potential. Currently supports finite
+molecules only (no PBC/stress).
+
 ## Tutorials
 
 You can run our [Colab tutorial](https://colab.research.google.com/drive/1D6EtMUjQPey_GkuxUAbPgld6_9ibIa-V?authuser=1#scrollTo=Z10787RE1N8T) to quickly get started with MACE.
