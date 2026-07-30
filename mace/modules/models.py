@@ -1507,14 +1507,24 @@ class AtomicXDMMACE(torch.nn.Module):
 
         readout_irreps = o3.Irreps(f"{num_xdm_targets}x0e")
 
-        # Interactions and readouts
+        # Interactions and readouts. Since the target (M1, M2, M3, Veff) is
+        # purely invariant scalars -- like energy, unlike a dipole -- the last
+        # layer's channels are reduced to scalars-only before the final
+        # readout, mirroring the base MACE energy model exactly (an l>0
+        # feature cannot contribute to a linear scalar readout by symmetry
+        # anyway, so carrying it through the last, most expensive
+        # correlation-order tensor product is wasted compute).
+        if num_interactions == 1:
+            hidden_irreps_out = str(hidden_irreps[0])
+        else:
+            hidden_irreps_out = hidden_irreps
         inter = interaction_cls_first(
             node_attrs_irreps=node_attr_irreps,
             node_feats_irreps=node_feats_irreps,
             edge_attrs_irreps=sh_irreps,
             edge_feats_irreps=edge_feats_irreps,
             target_irreps=interaction_irreps,
-            hidden_irreps=hidden_irreps,
+            hidden_irreps=hidden_irreps_out,
             avg_num_neighbors=avg_num_neighbors,
             radial_MLP=radial_MLP,
         )
@@ -1527,7 +1537,7 @@ class AtomicXDMMACE(torch.nn.Module):
         node_feats_irreps_out = inter.target_irreps
         prod = EquivariantProductBasisBlock(
             node_feats_irreps=node_feats_irreps_out,
-            target_irreps=hidden_irreps,
+            target_irreps=hidden_irreps_out,
             correlation=correlation,
             num_elements=num_elements,
             use_sc=use_sc_first,
@@ -1535,23 +1545,27 @@ class AtomicXDMMACE(torch.nn.Module):
         self.products = torch.nn.ModuleList([prod])
 
         self.readouts = torch.nn.ModuleList()
-        self.readouts.append(LinearReadoutBlock(hidden_irreps, readout_irreps))
+        self.readouts.append(LinearReadoutBlock(hidden_irreps_out, readout_irreps))
 
         for i in range(num_interactions - 1):
+            if i == num_interactions - 2:
+                hidden_irreps_out = str(hidden_irreps[0])  # scalars only for last layer
+            else:
+                hidden_irreps_out = hidden_irreps
             inter = interaction_cls(
                 node_attrs_irreps=node_attr_irreps,
                 node_feats_irreps=hidden_irreps,
                 edge_attrs_irreps=sh_irreps,
                 edge_feats_irreps=edge_feats_irreps,
                 target_irreps=interaction_irreps,
-                hidden_irreps=hidden_irreps,
+                hidden_irreps=hidden_irreps_out,
                 avg_num_neighbors=avg_num_neighbors,
                 radial_MLP=radial_MLP,
             )
             self.interactions.append(inter)
             prod = EquivariantProductBasisBlock(
                 node_feats_irreps=interaction_irreps,
-                target_irreps=hidden_irreps,
+                target_irreps=hidden_irreps_out,
                 correlation=correlation,
                 num_elements=num_elements,
                 use_sc=True,
@@ -1560,7 +1574,7 @@ class AtomicXDMMACE(torch.nn.Module):
             if i == num_interactions - 2:
                 self.readouts.append(
                     NonLinearReadoutBlock(
-                        hidden_irreps, MLP_irreps, gate, irrep_out=readout_irreps
+                        hidden_irreps_out, MLP_irreps, gate, irrep_out=readout_irreps
                     )
                 )
             else:
