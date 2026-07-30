@@ -93,6 +93,15 @@ gate_dict: Dict[str, Optional[Callable]] = {
     "None": None,
 }
 
+# Imported here (after gate_dict/interaction_classes above) rather than in the
+# main import block, since xdm_checkpoint needs those two names from this
+# same __init__ module -- importing it earlier would be a circular import.
+from .xdm_checkpoint import (  # noqa: E402
+    build_atomic_xdm_mace_from_args,
+    load_atomic_xdm_mace_checkpoint,
+    load_xdm_model,
+)
+
 __all__ = [
     "AtomicEnergiesBlock",
     "AtomicElementReferenceBlock",
@@ -118,6 +127,9 @@ __all__ = [
     "AtomicXDMMACE",
     "XDMDispersionEnergy",
     "MACEXDMDispersion",
+    "build_atomic_xdm_mace_from_args",
+    "load_atomic_xdm_mace_checkpoint",
+    "load_xdm_model",
     "EnergyDipolesMACE",
     "PolarMACE",
     "WeightedEnergyForcesLoss",

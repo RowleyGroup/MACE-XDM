@@ -278,6 +278,14 @@ mace_eval_xdm \
     --output="your_output.xyz"
 ```
 
+`--model` accepts either the full saved model (`<model_dir>/<name>.model`) or
+a training checkpoint (`<checkpoints_dir>/<name>_{latest,best}.pt`) --
+whichever you have on hand; both are detected automatically
+(`mace.modules.load_xdm_model`). Loading a full model on a CPU-only machine
+after training on a GPU also works out of the box, working around an
+e3nn<=0.4.x quirk where its internal `torch.jit.load` call doesn't forward
+`map_location` (see `mace.tools.safe_jit_load_map_location`/`load_full_model`).
+
 ### Adding XDM dispersion energy to a short-range MACE potential
 
 `MACEXDMDispersion` (`mace.modules`) combines a short-range MACE energy model

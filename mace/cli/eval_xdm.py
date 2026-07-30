@@ -10,6 +10,7 @@ import torch
 from ase.io import read, write
 
 from mace.data.xdm import build_xdm_atomic_data
+from mace.modules import load_xdm_model
 from mace.tools import AtomicNumberTable, init_device, set_default_dtype
 from mace.tools.torch_geometric.batch import Batch
 
@@ -22,8 +23,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--model",
         required=True,
-        help="Path to a .model file saved by run_train_xdm.py "
-        "(torch.save of the full nn.Module).",
+        help="Path to either a .model file (torch.save of the full "
+        "nn.Module, saved to --model_dir) or a training checkpoint "
+        "(<name>_{latest,best}.pt, saved to --checkpoints_dir) from "
+        "run_train_xdm.py.",
     )
     parser.add_argument(
         "--configs",
@@ -57,9 +60,7 @@ def main():
     set_default_dtype(args.default_dtype)
     device = init_device(args.device)
 
-    model = torch.load(args.model, map_location=device, weights_only=False)
-    model = model.to(device)
-    model.eval()
+    model = load_xdm_model(args.model, device=device)
 
     r_max = float(model.r_max.item())
     z_table = AtomicNumberTable(model.atomic_numbers.tolist())

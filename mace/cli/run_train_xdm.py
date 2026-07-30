@@ -13,7 +13,6 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-from e3nn import o3
 
 from mace.data import (
     XDMHDF5Dataset,
@@ -23,7 +22,12 @@ from mace.data import (
     discover_molecule_names,
     mlxdm_2x_reference_stats,
 )
-from mace.modules import AtomicXDMMACE, gate_dict, interaction_classes
+from mace.modules import (
+    AtomicXDMMACE,
+    build_atomic_xdm_mace_from_args,
+    gate_dict,
+    interaction_classes,
+)
 from mace.modules.utils import compute_avg_num_neighbors
 from mace.tools import (
     AtomicNumberTable,
@@ -439,24 +443,12 @@ def main():
         avg_num_neighbors = compute_avg_num_neighbors(train_loader)
     logging.info(f"Average number of neighbors: {avg_num_neighbors:.3f}")
 
-    model = AtomicXDMMACE(
-        r_max=args.r_max,
-        num_bessel=args.num_bessel,
-        num_polynomial_cutoff=args.num_polynomial_cutoff,
-        max_ell=args.max_ell,
-        interaction_cls=interaction_classes[args.interaction],
-        interaction_cls_first=interaction_classes[args.interaction_first],
-        num_interactions=args.num_interactions,
-        num_elements=len(z_table),
-        hidden_irreps=o3.Irreps(args.hidden_irreps),
-        MLP_irreps=o3.Irreps(args.MLP_irreps),
+    model = build_atomic_xdm_mace_from_args(
+        args=vars(args),
+        z_table=z_table,
         avg_num_neighbors=avg_num_neighbors,
-        atomic_numbers=z_table.zs,
-        correlation=args.correlation,
-        gate=gate_dict[args.gate],
         element_means=element_stats["mean"],
         element_stds=element_stats["std"],
-        num_xdm_targets=len(target_keys),
     ).to(device)
     logging.info(f"Number of parameters: {count_parameters(model)}")
 

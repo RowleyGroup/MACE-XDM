@@ -10,22 +10,24 @@ import torch
 from ase.calculators.calculator import Calculator, all_changes
 
 from mace.data import build_xdm_atomic_data, mlxdm_2x_polarizability_reference
-from mace.modules import MACEXDMDispersion, XDMDispersionEnergy
-from mace.tools import AtomicNumberTable
+from mace.modules import MACEXDMDispersion, XDMDispersionEnergy, load_xdm_model
+from mace.tools import AtomicNumberTable, load_full_model
 from mace.tools.torch_geometric.batch import Batch
 
 
 class MACEXDMDispersionCalculator(Calculator):
     """ASE calculator for E_total = E_short_range(MACE) + E_dispersion(XDM).
 
-    Loads a short-range MACE energy model and a trained AtomicXDMMACE model
-    (both saved as full ``torch.save``'d modules, e.g. by ``mace_run_train``/
-    ``mace_run_train_xdm``), builds the dispersion-energy module from MLXDM's
-    fixed reference constants by default (override with ``alpha_free``/
-    ``v_free`` for a different element set), and exposes the combination as a
-    normal ASE calculator. Finite molecules only (no PBC/stress support, since
-    the dispersion sum currently uses a dense non-periodic pairwise distance
-    matrix -- see ``XDMDispersionEnergy``).
+    Loads a short-range MACE energy model (a full ``torch.save``'d module,
+    e.g. ``<model_dir>/<name>.model`` from ``mace_run_train``) and a trained
+    AtomicXDMMACE model -- which may be either a full saved module or a
+    ``mace_run_train_xdm`` training checkpoint (``<name>_{latest,best}.pt``);
+    both are handled automatically. Builds the dispersion-energy module from
+    MLXDM's fixed reference constants by default (override with
+    ``alpha_free``/``v_free`` for a different element set), and exposes the
+    combination as a normal ASE calculator. Finite molecules only (no
+    PBC/stress support, since the dispersion sum currently uses a dense
+    non-periodic pairwise distance matrix -- see ``XDMDispersionEnergy``).
     """
 
     implemented_properties = ["energy", "free_energy", "forces"]
@@ -46,12 +48,8 @@ class MACEXDMDispersionCalculator(Calculator):
         Calculator.__init__(self, **kwargs)
         self.device = torch.device(device)
 
-        short_range_model = torch.load(
-            short_range_model_path, map_location=self.device, weights_only=False
-        )
-        xdm_model = torch.load(xdm_model_path, map_location=self.device, weights_only=False)
-        short_range_model.eval()
-        xdm_model.eval()
+        short_range_model = load_full_model(short_range_model_path, device=self.device)
+        xdm_model = load_xdm_model(xdm_model_path, device=self.device)
 
         xdm_z_table = AtomicNumberTable(xdm_model.atomic_numbers.tolist())
         if alpha_free is None or v_free is None:
