@@ -310,6 +310,28 @@ omitting it evaluates every molecule in `--test_files` instead. Add
 `--max_conformers 20000` to get a quick read on a very large dataset without
 waiting to score the whole thing.
 
+If training looks slower or noisier than expected, it's worth checking
+whether the *default* fixed MLXDM reference mean/std (used to standardize
+targets, see below) actually matches your dataset's real distribution --
+`mace_compare_xdm_stats` computes the actual empirical per-element mean/std
+from your data and prints it side by side with the fixed constants, flagging
+any element/property where they disagree by more than 1 empirical std (mean)
+or 2x (std):
+
+```sh
+mace_compare_xdm_stats \
+    --train_files="your_xdm_dataset.h5" \
+    --split_file="results/xdm_model_split.json" \
+    --atomic_numbers="1,6,7,8,9,16,17"
+```
+
+A mismatch isn't a code bug, but it does mean the network first has to
+compensate for a miscalibrated prior before it's really fitting structure --
+a large std mismatch in particular can produce unnecessarily large or small
+standardized-space gradients. `--max_molecules` (default 2000) subsamples for
+speed, since the underlying statistics computation isn't vectorized and
+scanning millions of conformers would take a long time.
+
 ### Adding XDM dispersion energy to a short-range MACE potential
 
 `MACEXDMDispersion` (`mace.modules`) combines a short-range MACE energy model
