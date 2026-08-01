@@ -15,6 +15,8 @@ from typing import List, Optional
 import numpy as np
 from ase.data import chemical_symbols
 
+import h5py
+
 from mace.cli.run_train_xdm import expand_file_patterns
 from mace.data import (
     compute_xdm_element_statistics,
@@ -22,6 +24,7 @@ from mace.data import (
     discover_molecule_names,
     mlxdm_2x_reference_stats,
 )
+from mace.data.xdm import find_leaf_groups, molecule_name
 from mace.tools import AtomicNumberTable, setup_logger
 
 DEFAULT_TARGET_KEYS = ("M1", "M2", "M3", "Veff")
@@ -91,6 +94,31 @@ def main():
             rng.choice(molecule_names, size=args.max_molecules, replace=False)
         )
         logging.info(f"Subsampled to {len(molecule_names)} molecules for speed")
+
+    file_names = set()
+    for path in train_files:
+        with h5py.File(path, "r") as f:
+            for leaf in find_leaf_groups(f):
+                file_names.add(molecule_name(leaf))
+    overlap = set(molecule_names) & file_names
+    if not overlap:
+        example_wanted = list(molecule_names)[:5]
+        example_found = list(file_names)[:5]
+        raise SystemExit(
+            "None of the requested molecule names were found as leaf groups in "
+            "--train_files -- --train_files is very likely not the same file(s) "
+            "the --split_file was generated from, or the leaf-group naming "
+            f"differs.\n  wanted (from --split_file/--train_files), e.g.: {example_wanted}\n"
+            f"  found in --train_files, e.g.: {example_found}\n"
+            "Compare these directly to spot the mismatch (extra path prefix, "
+            "different separator, wrong file, etc.)."
+        )
+    if len(overlap) < len(molecule_names):
+        logging.warning(
+            f"Only {len(overlap)}/{len(molecule_names)} requested molecule names "
+            "were found in --train_files; proceeding with the overlap."
+        )
+        molecule_names = list(overlap)
 
     logging.info("Computing empirical per-element statistics (this reads every "
                  "conformer of each selected molecule once)...")
