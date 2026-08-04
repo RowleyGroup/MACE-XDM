@@ -1,14 +1,24 @@
 ###########################################################################################
-# Fixed per-element reference mean/std for XDM moments (M1, M2, M3) and effective
-# volume (Veff), matching the values used by RowleyGroup/MLXDM's ANI-2x-based
-# dispersion model (torchanipbe0/resources/dispersion_2x/{m1,m2,m3,v}/best.param).
+# Fixed per-element reference mean/standardization-width for XDM moments (M1,
+# M2, M3) and effective volume (Veff), matching the values used by
+# RowleyGroup/MLXDM's ANI-2x-based dispersion model
+# (torchanipbe0/resources/dispersion_2x/{m1,m2,m3,v}/best.param).
 #
 # MLXDM's "Shifter" module computes physical = b0 + b1 * standardized, with b0
-# the per-element mean and b1 the per-element std, for elements in the fixed
-# order used by its ANI-2x species vector: H, C, N, O, S, F, Cl. This exactly
-# matches AtomicElementReferenceBlock's `mean[Z] + std[Z] * standardized`, so
-# these constants can be dropped in directly in place of statistics computed
-# from a given training set.
+# the per-element mean and b1 a per-element standardization width, for
+# elements in the fixed order used by its ANI-2x species vector: H, C, N, O,
+# S, F, Cl. b1 is *not* necessarily the empirical std of any one dataset --
+# per-element M1/M2/M3/Veff distributions are multi-modal (the same element
+# takes on very different values in different bonding environments), so b1 is
+# chosen wide enough for well-behaved z-scoring across that whole multi-modal,
+# chemically diverse ANI-2x space. A narrower training set (e.g. one that
+# doesn't sample the full breadth of bonding environments ANI-2x does) can
+# have a substantially smaller empirical std than b1 without anything being
+# miscalibrated -- see mace_compare_xdm_stats. This still matches
+# AtomicElementReferenceBlock's `mean[Z] + std[Z] * standardized` exactly
+# (that block's "std" is just whatever scale you give it), so these constants
+# can be dropped in directly in place of statistics computed from a given
+# training set.
 ###########################################################################################
 
 from typing import Dict, Sequence
@@ -88,8 +98,13 @@ def mlxdm_2x_reference_stats(
     target_keys: Sequence[str] = CANONICAL_PROPERTIES,
 ) -> Dict[str, np.ndarray]:
     """Build ``mean``/``std`` arrays of shape ``[len(z_table), 4]`` from MLXDM's
-    fixed ANI-2x reference statistics, ready to feed into
-    ``AtomicElementReferenceBlock``/``AtomicXDMMACE``.
+    fixed ANI-2x reference mean/standardization-width, ready to feed into
+    ``AtomicElementReferenceBlock``/``AtomicXDMMACE``. The ``"std"`` entry is a
+    standardization width chosen for MLXDM's own multi-modal, chemically
+    diverse ANI-2x training distribution, not necessarily the empirical std of
+    whatever dataset you're training on -- use ``mace_compare_xdm_stats`` to
+    check, and ``--element_stats dataset`` if you'd rather standardize by your
+    own data's actual empirical mean/std instead.
 
     ``target_keys`` only needs to have length 4 and is interpreted positionally
     as (M1, M2, M3, Veff) regardless of the actual HDF5 dataset key names used

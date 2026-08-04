@@ -1,10 +1,13 @@
 ###########################################################################################
-# Compare the fixed MLXDM ANI-2x reference mean/std (the default standardization
-# used by mace_run_train_xdm --element_stats mlxdm_2x) against a dataset's actual
-# empirical per-element statistics. A mismatch here isn't a code bug, but it makes
-# the standardized-space loss harder to interpret and can slow/destabilize
-# training -- the network first has to compensate for a miscalibrated prior
-# before it's really fitting structure.
+# Compare the fixed MLXDM ANI-2x reference mean/standardization-width (the
+# default standardization used by mace_run_train_xdm --element_stats
+# mlxdm_2x) against a dataset's actual empirical per-element mean/std. A
+# mismatch isn't necessarily a code bug -- MLXDM's width is chosen to cover
+# its own multi-modal, chemically diverse ANI-2x training distribution, and a
+# narrower dataset can legitimately have a much smaller empirical std -- but
+# it does mean the standardized-space loss is harder to interpret and training
+# gets a diluted gradient signal, since the network is fitting a target
+# compressed well below unit variance for this data.
 ###########################################################################################
 
 import argparse
@@ -139,7 +142,7 @@ def main():
 
     print(
         f"\n{'elem':<5}{'prop':<6}{'emp_mean':>12}{'fix_mean':>12}{'mean_z':>9}"
-        f"{'emp_std':>12}{'fix_std':>12}{'std_ratio':>10}  flag"
+        f"{'emp_std':>12}{'fix_width':>12}{'width_ratio':>12}  flag"
     )
     for idx, z in enumerate(z_table.zs):
         symbol = chemical_symbols[z]
@@ -149,18 +152,18 @@ def main():
             flag = ""
             if fixed is not None:
                 fix_mean = fixed["mean"][idx, j]
-                fix_std = fixed["std"][idx, j]
+                fix_width = fixed["std"][idx, j]
                 mean_z = (fix_mean - emp_mean) / emp_std if emp_std > 0 else float("nan")
-                std_ratio = fix_std / emp_std if emp_std > 0 else float("nan")
+                width_ratio = fix_width / emp_std if emp_std > 0 else float("nan")
                 if abs(mean_z) > 1.0:
                     flag += "mean off by >1 empirical std; "
-                if std_ratio == std_ratio and (std_ratio > 2.0 or std_ratio < 0.5):
-                    flag += "std off by >2x"
+                if width_ratio == width_ratio and (width_ratio > 2.0 or width_ratio < 0.5):
+                    flag += "width off by >2x"
             else:
-                fix_mean = fix_std = mean_z = std_ratio = float("nan")
+                fix_mean = fix_width = mean_z = width_ratio = float("nan")
             print(
                 f"{symbol:<5}{key:<6}{emp_mean:>12.4f}{fix_mean:>12.4f}{mean_z:>9.2f}"
-                f"{emp_std:>12.4f}{fix_std:>12.4f}{std_ratio:>10.3f}  {flag}"
+                f"{emp_std:>12.4f}{fix_width:>12.4f}{width_ratio:>12.3f}  {flag}"
             )
 
     counts_str = ", ".join(
@@ -168,13 +171,21 @@ def main():
     )
     print(f"\nAtom instances used per element: {counts_str}")
     print(
+        "\nfix_width/width_ratio: the fixed MLXDM reference is a standardization "
+        "width, not necessarily the literal empirical std of any one dataset -- "
+        "it's chosen to cover MLXDM's own multi-modal, chemically diverse "
+        "ANI-2x distribution, so a narrower or more homogeneous dataset can "
+        "legitimately have a much smaller empirical std without anything "
+        "being miscalibrated."
+    )
+    print(
         "\nmean_z: how many empirical std's away the fixed MLXDM mean is from "
         "this dataset's actual mean (near 0 = well matched; e.g. 2.0 means the "
         "fixed prior's center is 2 empirical std's off)."
     )
     print(
-        "std_ratio: fixed_std / empirical_std (near 1 = well matched; >1 means "
-        "the fixed prior assumes more spread than this data has, so "
+        "width_ratio: fixed_width / empirical_std (near 1 = well matched; >1 "
+        "means the fixed width covers more spread than this data has, so "
         "standardized targets are smaller than intended -- less gradient "
         "signal; <1 means the opposite -- larger standardized targets, larger "
         "gradients, more risk of instability)."

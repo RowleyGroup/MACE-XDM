@@ -192,14 +192,23 @@ Predictions are made in per-element standardized (z-score) units: for each
 chemical element, the network predicts a standardized residual, which is
 mapped back to physical units by `AtomicElementReferenceBlock` via
 `physical = mean[Z] + std[Z] * standardized` — the same convention as MLXDM's
-own `Shifter` module (`b0 + b1 * x`, with `b0`/`b1` the per-element mean/std).
-By default (`--element_stats=mlxdm_2x`), these mean/std values are *not*
-computed from your training data — they're the fixed reference statistics for
-H, C, N, O, S, F, Cl taken directly from RowleyGroup/MLXDM's ANI-2x dispersion
-model (`torchanipbe0/resources/dispersion_2x/{m1,m2,m3,v}/best.param`), so a
-model trained this way standardizes targets exactly the way MLXDM does. Pass
-`--element_stats=dataset` to instead compute mean/std from your own training
-molecules (required if your dataset includes elements outside that set of 7).
+own `Shifter` module (`b0 + b1 * x`, with `b0` the per-element mean and `b1` a
+per-element standardization width). By default (`--element_stats=mlxdm_2x`),
+these mean/width values are *not* computed from your training data — they're
+the fixed reference values for H, C, N, O, S, F, Cl taken directly from
+RowleyGroup/MLXDM's ANI-2x dispersion model
+(`torchanipbe0/resources/dispersion_2x/{m1,m2,m3,v}/best.param`), so a model
+trained this way standardizes targets exactly the way MLXDM does. Note that
+`b1` is a width chosen to cover MLXDM's own multi-modal, chemically diverse
+ANI-2x training distribution (the same element takes on very different values
+in different bonding environments), not the literal empirical std of any
+particular dataset — a narrower or more homogeneous training set can have a
+substantially smaller true std without anything being miscalibrated; use
+`mace_compare_xdm_stats` (below) to check. Pass `--element_stats=dataset` to
+instead compute mean/std directly from your own training molecules (required
+if your dataset includes elements outside that set of 7, and generally gives
+a better-scaled gradient signal if your data doesn't span MLXDM's full
+chemical breadth).
 
 ### Dataset format
 
@@ -311,12 +320,16 @@ omitting it evaluates every molecule in `--test_files` instead. Add
 waiting to score the whole thing.
 
 If training looks slower or noisier than expected, it's worth checking
-whether the *default* fixed MLXDM reference mean/std (used to standardize
-targets, see below) actually matches your dataset's real distribution --
-`mace_compare_xdm_stats` computes the actual empirical per-element mean/std
-from your data and prints it side by side with the fixed constants, flagging
-any element/property where they disagree by more than 1 empirical std (mean)
-or 2x (std):
+whether the *default* fixed MLXDM reference mean/standardization-width (used
+to standardize targets, see below) actually matches your dataset's real
+distribution -- `mace_compare_xdm_stats` computes the actual empirical
+per-element mean/std from your data and prints it side by side with the fixed
+values, flagging any element/property where they disagree by more than 1
+empirical std (mean) or 2x (width). A width mismatch on its own isn't
+necessarily wrong (MLXDM's width covers a broader, multi-modal chemical space
+than any one dataset may sample), but it does mean the standardized loss is
+harder to interpret and training gets a weaker gradient signal than a width
+matched to your own data would give:
 
 ```sh
 mace_compare_xdm_stats \

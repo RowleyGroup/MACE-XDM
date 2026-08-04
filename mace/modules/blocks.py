@@ -1403,10 +1403,15 @@ class AtomicElementReferenceBlock(torch.nn.Module):
 
     Generalizes AtomicEnergiesBlock/ScaleShiftBlock from a single scalar (energy)
     to several simultaneous per-atom target properties (e.g. XDM's M1, M2, M3,
-    Veff): each chemical element has its own mean and std for each property,
-    computed from the training set. The network predicts the standardized
-    (z-scored) residual and this block maps it back to physical units:
+    Veff): each chemical element has its own mean and standardization width for
+    each property. The network predicts the standardized residual and this
+    block maps it back to physical units:
         physical = mean[Z] + std[Z] * standardized
+    ``std`` need not be the literal empirical std of a specific dataset -- it's
+    just whatever per-element scale was used to standardize the training
+    targets (computed from the training set via ``--element_stats dataset``,
+    or a fixed width chosen for some other, possibly broader/multi-modal,
+    reference distribution, e.g. ``--element_stats mlxdm_2x``).
     """
 
     mean: torch.Tensor
