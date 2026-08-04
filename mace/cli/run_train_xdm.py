@@ -195,9 +195,17 @@ def build_parser() -> argparse.ArgumentParser:
         "--loss_weights",
         nargs=4,
         type=float,
-        default=[1.0, 1.0, 1.0, 1.0],
+        default=[1.0, 0.15, 0.4, 1.0],
         metavar=("W_M1", "W_M2", "W_M3", "W_VEFF"),
-        help="Per-property weights for the standardized-space MSE loss.",
+        help="Per-property weights for the standardized-space MSE loss. "
+        "Default reflects each moment's role in the XDM dispersion series for "
+        "nearest-neighbour intermolecular interactions: C6 (~60%% of the "
+        "energy) depends only on M1 and Veff (via alpha), which also both "
+        "appear in the numerator and denominator of C8 and C10, so they gate "
+        "the whole series; M3 additionally enters C8 (~30%%) and C10 (~10%%); "
+        "M2 only enters C10, and even then alongside M3, with no M4 term "
+        "involved. Pass explicit weights to override, e.g. for a different "
+        "dispersion regime or equal per-property weighting (`1 1 1 1`).",
     )
 
     # Misc / bookkeeping

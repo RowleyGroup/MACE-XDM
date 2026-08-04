@@ -210,6 +210,17 @@ if your dataset includes elements outside that set of 7, and generally gives
 a better-scaled gradient signal if your data doesn't span MLXDM's full
 chemical breadth).
 
+`--loss_weights W_M1 W_M2 W_M3 W_VEFF` sets the per-property weight in the
+standardized-space MSE loss, default `1.0 0.15 0.4 1.0`. This reflects each
+moment's role in the XDM dispersion series for nearest-neighbour
+intermolecular interactions: C6 (~60% of the energy) depends only on M1 and
+Veff (via the atom-in-molecule polarizability), and both also appear in the
+numerator and denominator of C8 and C10, so they gate the whole series; M3
+additionally enters C8 (~30%) and C10 (~10%); M2 only enters C10, and even
+there alongside M3, with no M4 term involved. Pass explicit weights (e.g.
+`1 1 1 1` for equal weighting) if this dispersion regime or breakdown doesn't
+apply to your use case.
+
 ### Dataset format
 
 Training data is expected as one or more ANI-style HDF5 files, e.g. many files
