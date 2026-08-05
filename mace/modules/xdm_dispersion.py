@@ -14,7 +14,7 @@
 # cheap relative to either neural network's forward pass.
 ###########################################################################################
 
-from typing import Union
+from typing import Dict, Union
 
 import numpy as np
 import torch
@@ -72,7 +72,11 @@ class XDMDispersionEnergy(torch.nn.Module):
         batch: torch.Tensor,  # [n_nodes], graph index per atom
         num_graphs: int,
         xdm_atomic: torch.Tensor,  # [n_nodes, 4] = (M1, M2, M3, Veff), atomic units
-    ) -> torch.Tensor:  # [num_graphs], Hartree
+        return_components: bool = False,
+    ) -> Union[torch.Tensor, Dict[str, torch.Tensor]]:
+        # [num_graphs] Hartree, or (if return_components) a dict with the
+        # separate C6/C8/C10 terms alongside "total" -- e.g. to judge how much
+        # of a dispersion-energy error traces back to each term.
         m1 = xdm_atomic[:, 0]
         m2 = xdm_atomic[:, 1]
         m3 = xdm_atomic[:, 2]
@@ -96,7 +100,10 @@ class XDMDispersionEnergy(torch.nn.Module):
 
         idx_i, idx_j = torch.nonzero(mask, as_tuple=True)
         if idx_i.numel() == 0:
-            return torch.zeros(num_graphs, dtype=positions.dtype, device=positions.device)
+            zeros = torch.zeros(num_graphs, dtype=positions.dtype, device=positions.device)
+            if return_components:
+                return {"total": zeros, "e6": zeros, "e8": zeros, "e10": zeros}
+            return zeros
 
         r = dist[idx_i, idx_j]
         m1_i, m1_j = m1[idx_i], m1[idx_j]
@@ -114,11 +121,19 @@ class XDMDispersionEnergy(torch.nn.Module):
         ) / 3.0  # bohr
         r_vdw = self.a2 + self.a1 * r_crit * self.bohr_to_angstrom  # Angstrom
 
-        e_pair = -(
-            c6 / (r.pow(6) + r_vdw.pow(6)) * self.bohr_to_angstrom.pow(6)
-            + c8 / (r.pow(8) + r_vdw.pow(8)) * self.bohr_to_angstrom.pow(8)
-            + c10 / (r.pow(10) + r_vdw.pow(10)) * self.bohr_to_angstrom.pow(10)
-        )  # Hartree, per pair
+        e6_pair = -c6 / (r.pow(6) + r_vdw.pow(6)) * self.bohr_to_angstrom.pow(6)
+        e8_pair = -c8 / (r.pow(8) + r_vdw.pow(8)) * self.bohr_to_angstrom.pow(8)
+        e10_pair = -c10 / (r.pow(10) + r_vdw.pow(10)) * self.bohr_to_angstrom.pow(10)
 
         graph_idx = batch[idx_i]
-        return scatter_sum(e_pair, graph_idx, dim=0, dim_size=num_graphs)
+        total = scatter_sum(
+            e6_pair + e8_pair + e10_pair, graph_idx, dim=0, dim_size=num_graphs
+        )
+        if return_components:
+            return {
+                "total": total,
+                "e6": scatter_sum(e6_pair, graph_idx, dim=0, dim_size=num_graphs),
+                "e8": scatter_sum(e8_pair, graph_idx, dim=0, dim_size=num_graphs),
+                "e10": scatter_sum(e10_pair, graph_idx, dim=0, dim_size=num_graphs),
+            }
+        return total

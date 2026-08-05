@@ -66,13 +66,28 @@ def test_xdm_dispersion_energy_matches_hand_computation():
     r_vdw = a2 + a1 * r_crit * BOHR_TO_ANGSTROM
 
     r = 3.0
-    e_manual = -(
-        C6 / (r**6 + r_vdw**6) * BOHR_TO_ANGSTROM**6
-        + C8 / (r**8 + r_vdw**8) * BOHR_TO_ANGSTROM**8
-        + C10 / (r**10 + r_vdw**10) * BOHR_TO_ANGSTROM**10
-    )
+    e6_manual = -C6 / (r**6 + r_vdw**6) * BOHR_TO_ANGSTROM**6
+    e8_manual = -C8 / (r**8 + r_vdw**8) * BOHR_TO_ANGSTROM**8
+    e10_manual = -C10 / (r**10 + r_vdw**10) * BOHR_TO_ANGSTROM**10
+    e_manual = e6_manual + e8_manual + e10_manual
 
     assert torch.allclose(e_disp, torch.tensor([e_manual]), rtol=1e-10)
+
+    components = module(
+        positions=positions,
+        node_attrs=node_attrs,
+        batch=batch,
+        num_graphs=1,
+        xdm_atomic=xdm_atomic,
+        return_components=True,
+    )
+    assert torch.allclose(components["total"], e_disp)
+    assert torch.allclose(components["e6"], torch.tensor([e6_manual]), rtol=1e-10)
+    assert torch.allclose(components["e8"], torch.tensor([e8_manual]), rtol=1e-10)
+    assert torch.allclose(components["e10"], torch.tensor([e10_manual]), rtol=1e-10)
+    assert torch.allclose(
+        components["e6"] + components["e8"] + components["e10"], components["total"]
+    )
 
 
 def test_xdm_dispersion_energy_invariances_and_forces():

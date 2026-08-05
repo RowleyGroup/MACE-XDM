@@ -330,6 +330,31 @@ omitting it evaluates every molecule in `--test_files` instead. Add
 `--max_conformers 20000` to get a quick read on a very large dataset without
 waiting to score the whole thing.
 
+`mace_test_xdm`'s metrics are on the raw M1/M2/M3/Veff regression targets,
+which don't by themselves say how much any given error actually matters
+physically -- a mediocre M2 fit may barely move the dispersion energy, while
+a small M1 error can shift it substantially. `mace_test_xdm_dispersion`
+instead judges the model by the actual downstream quantity: it computes the
+XDM dispersion energy (via the same Becke-Johnson-damped C6+C8+C10 formula
+used in training/production) from both the model's predicted per-atom
+moments and the dataset's true ones, per test molecule, and reports MAE/RMSE/
+R²/Pearson r for the total energy and for the C6, C8, C10 components
+separately -- so it's clear whether error is concentrated in the term that
+matters most (C6, typically ~60% of nearest-neighbour intermolecular
+dispersion) or in a smaller one:
+
+```sh
+mace_test_xdm_dispersion \
+    --model="checkpoints/xdm_model_best.pt" \
+    --test_files="your_xdm_dataset.h5" \
+    --split_file="results/xdm_model_split.json" \
+    --output_dir="test_dispersion_results"
+```
+
+Same `--split_file`/`--max_conformers` conventions as `mace_test_xdm`. Since
+the dispersion energy needs an O(atoms²) pairwise distance matrix per
+molecule (not just per-atom predictions), `--batch_size` defaults lower (32).
+
 If training looks slower or noisier than expected, it's worth checking
 whether the *default* fixed MLXDM reference mean/standardization-width (used
 to standardize targets, see below) actually matches your dataset's real
