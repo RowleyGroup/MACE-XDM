@@ -471,6 +471,38 @@ sub-models' contributions), not by adding separately-computed forces, so
 they are exact for the combined potential. Currently supports finite
 molecules only (no PBC/stress).
 
+#### Evaluating on intermolecular complex/monomer data
+
+`mace_eval_intermolecular_xdm` judges the combined potential on what it's
+actually for: predicted intermolecular interaction energies, `E(complex) -
+E(frag_1) - E(frag_2)`, against QM reference values. It expects an HDF5 file
+with one leaf group per complex and one per monomer fragment -- e.g. as
+written by a postg/Gaussian-parsing script that computes each complex and its
+two fragments separately (the reference PBE0 energy and XDM dispersion energy
+each stored per structure). Complex/fragment groups are matched by their
+trailing `_<index>` (fragments additionally end `.frag_1`/`.frag_2`) --
+deliberately independent of whatever prefix text comes before the index, so a
+complex/fragment prefix mismatch in the naming (not uncommon -- data-prep
+scripts evolve) doesn't silently drop triplets:
+
+```sh
+mace_eval_intermolecular_xdm \
+    --short_range_model="short_range_pbe0.model" \
+    --xdm_model="xdm_model.model" \
+    --data_files="complexes_and_monomers.h5" \
+    --output_dir="intermolecular_results"
+```
+
+Reports MAE/RMSE/R²/Pearson r (in kcal/mol) for three interaction energies
+separately: PBE0 alone (short-range model only, no dispersion), XDM alone
+(the dispersion-energy output only), and PBE0+XDM (the full combined
+model) -- matching the three quantities a typical postg-based reference
+pipeline computes. `--energy_key`/`--exdm_key` (default `energies`/`e_xdm`)
+name the QM reference Hartree-unit datasets on each structure;
+`--max_triplets` subsamples complexes for a quick look. Writes a JSON report,
+a CSV of every complex's true/predicted values, and a scatter plot
+(`--no_plots` to skip).
+
 ## Tutorials
 
 You can run our [Colab tutorial](https://colab.research.google.com/drive/1D6EtMUjQPey_GkuxUAbPgld6_9ibIa-V?authuser=1#scrollTo=Z10787RE1N8T) to quickly get started with MACE.
