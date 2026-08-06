@@ -493,6 +493,16 @@ def main():
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         start_epoch = checkpoint["epoch"] + 1
         best_valid_loss = checkpoint["best_valid_loss"]
+        epochs_without_improvement = checkpoint.get("epochs_without_improvement", 0)
+        if "scheduler_state_dict" in checkpoint:
+            scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+        else:
+            logging.warning(
+                "Checkpoint has no scheduler_state_dict (saved before this was "
+                "tracked) -- the LR scheduler's plateau-detection state (its "
+                "count of epochs without improvement) starts fresh from this "
+                "restart rather than continuing where it left off."
+            )
         logging.info(f"Restarted from {latest_path} at epoch {start_epoch}")
 
     def save_checkpoint(path: Path, epoch: int):
@@ -500,8 +510,10 @@ def main():
             {
                 "model_state_dict": model.state_dict(),
                 "optimizer_state_dict": optimizer.state_dict(),
+                "scheduler_state_dict": scheduler.state_dict(),
                 "epoch": epoch,
                 "best_valid_loss": best_valid_loss,
+                "epochs_without_improvement": epochs_without_improvement,
                 "args": vars(args),
                 "z_table": z_table.zs,
                 "element_mean": element_stats["mean"].tolist(),

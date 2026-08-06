@@ -286,6 +286,16 @@ standardization (see above) are stored in the checkpoint regardless of source.
 The best model (lowest validation loss) is saved to `<model_dir>/<name>.model`,
 ready for evaluation or downstream use.
 
+Pass `--restart_latest` to resume from `<checkpoints_dir>/<name>_latest.pt` --
+useful when a job gets interrupted (SLURM walltime, a node failure) partway
+through. This restores the `ReduceLROnPlateau` scheduler's and early-stopping's
+internal state (how many evaluations since the last improvement) along with
+the model/optimizer, so a run that gets restarted repeatedly still decays its
+learning rate and early-stops on the same schedule as one that never was --
+restarting doesn't reset either patience clock back to zero. Checkpoints
+written before this was tracked restart with both clocks starting fresh
+(logged as a warning) rather than failing to load.
+
 ### Evaluation
 
 To run a trained model on new structures (any ASE-readable format) and
