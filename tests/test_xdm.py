@@ -288,3 +288,60 @@ def test_atomic_xdm_mace_training_step_reduces_loss(tmp_path):
     last_loss = epoch_loss()
 
     assert last_loss < first_loss
+
+
+def test_atomic_xdm_mace_final_readout_is_per_element():
+    z_table = AtomicNumberTable([1, 6, 8])  # H, C, O
+    model = _build_model(z_table)
+
+    assert isinstance(
+        model.final_readout,
+        (modules.PerElementLinearReadoutBlock, modules.PerElementNonLinearReadoutBlock),
+    )
+
+    # A water molecule (O, H, H) so all three elements have atoms.
+    atomic_numbers = np.array([8, 1, 1])
+    positions = np.array([[0.0, 0.0, 0.0], [0.0, 0.76, 0.59], [0.0, -0.76, 0.59]])
+    targets = np.zeros((3, 4))
+    graph = build_xdm_atomic_data(atomic_numbers, positions, targets, z_table, cutoff=5.0)
+    batch = Batch.from_data_list([graph])
+    data = batch.to_dict()
+
+    with torch.no_grad():
+        before = model(data)["xdm_standardized"].clone()
+
+    # Perturb only H's (index 0) final-readout weights.
+    with torch.no_grad():
+        model.final_readout.linear_2.weight[0] += 1.0
+        model.final_readout.linear_2.bias[0] += 1.0
+
+    with torch.no_grad():
+        after = model(data)["xdm_standardized"]
+
+    is_h = np.array([False, True, True])  # O, H, H
+    # Perturbing H's weights must change H atoms' predictions...
+    assert not torch.allclose(before[is_h], after[is_h])
+    # ...and must leave every other element's predictions untouched, since
+    # they no longer share any final-layer weights with H.
+    assert torch.allclose(before[~is_h], after[~is_h])
+
+
+def test_atomic_xdm_mace_final_readout_gradients_are_element_isolated():
+    z_table = AtomicNumberTable([1, 6, 8])  # H, C, O
+    model = _build_model(z_table)
+
+    atomic_numbers = np.array([8, 1, 1])
+    positions = np.array([[0.0, 0.0, 0.0], [0.0, 0.76, 0.59], [0.0, -0.76, 0.59]])
+    targets = np.zeros((3, 4))
+    graph = build_xdm_atomic_data(atomic_numbers, positions, targets, z_table, cutoff=5.0)
+    batch = Batch.from_data_list([graph])
+
+    output = model(batch.to_dict())
+    is_h = torch.tensor([False, True, True])
+    # A loss computed only from H atoms should never produce a gradient on
+    # O's (index 2) dedicated final-readout weights.
+    loss = output["xdm_standardized"][is_h].pow(2).sum()
+    loss.backward()
+
+    assert model.final_readout.linear_2.weight.grad[0].abs().sum() > 0  # H: touched
+    assert model.final_readout.linear_2.weight.grad[2].abs().sum() == 0  # O: untouched

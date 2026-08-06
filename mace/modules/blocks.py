@@ -115,6 +115,90 @@ class NonLinearReadoutBlock(torch.nn.Module):
         return self.linear_2(x)  # [n_nodes, len(heads)]
 
 
+def _assert_scalar_irreps(irreps: o3.Irreps, who: str) -> None:
+    if any(mul_ir.ir.l != 0 or mul_ir.ir.p != 1 for mul_ir in irreps):
+        raise ValueError(
+            f"{who} only supports invariant scalar (0e) irreps, got {irreps}. "
+            "Per-element weight selection via a one-hot is only a well-defined "
+            "equivariant operation for invariant scalars -- there's no "
+            "rotation-consistent way to pick a per-element weight for l>0 "
+            "features the way there is for a plain per-element scalar affine map."
+        )
+
+
+@compile_mode("script")
+class PerElementLinearReadoutBlock(torch.nn.Module):
+    """Linear readout with its own dedicated weight matrix and bias per
+    element, instead of one linear map shared across every element.
+
+    Motivation: a shared readout is fit as a flat average over every atom
+    regardless of element, so a rare element (a small fraction of atoms) has
+    little influence on it relative to abundant ones -- its prediction quality
+    can be limited by, or even regress toward, whatever compromise best suits
+    the abundant elements. Giving every element its own readout weights
+    removes that competition for the last layer's capacity, the same way
+    ANI-style per-element networks never share weights across elements at
+    all, while still sharing the equivariant backbone that produces the
+    scalar features this operates on.
+    """
+
+    def __init__(self, irreps_in: o3.Irreps, irrep_out: o3.Irreps, num_elements: int):
+        super().__init__()
+        irreps_in = o3.Irreps(irreps_in)
+        irrep_out = o3.Irreps(irrep_out)
+        _assert_scalar_irreps(irreps_in, "PerElementLinearReadoutBlock irreps_in")
+        _assert_scalar_irreps(irrep_out, "PerElementLinearReadoutBlock irrep_out")
+        self.in_dim = irreps_in.dim
+        self.out_dim = irrep_out.dim
+        self.num_elements = num_elements
+        self.weight = torch.nn.Parameter(
+            torch.randn(num_elements, self.in_dim, self.out_dim) / (self.in_dim**0.5)
+        )
+        self.bias = torch.nn.Parameter(torch.zeros(num_elements, self.out_dim))
+
+    def forward(
+        self,
+        x: torch.Tensor,  # [n_nodes, in_dim]
+        node_attrs: torch.Tensor,  # [n_nodes, num_elements], one-hot
+    ) -> torch.Tensor:  # [n_nodes, out_dim]
+        per_element_out = torch.einsum("ni,eio->neo", x, self.weight)
+        out = torch.einsum("neo,ne->no", per_element_out, node_attrs)
+        bias = torch.einsum("eo,ne->no", self.bias, node_attrs)
+        return out + bias
+
+
+@compile_mode("script")
+class PerElementNonLinearReadoutBlock(torch.nn.Module):
+    """Two-layer, per-element-weighted, gated readout -- the per-element
+    analogue of ``NonLinearReadoutBlock`` (see ``PerElementLinearReadoutBlock``
+    for the motivation). Operates entirely on invariant scalars, so the gate
+    is applied elementwise directly rather than via e3nn's irreps-aware
+    ``Activation`` wrapper (which exists to handle gating mixed-irreps
+    features, not needed here).
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Callable,
+        irrep_out: o3.Irreps,
+        num_elements: int,
+    ):
+        super().__init__()
+        self.linear_1 = PerElementLinearReadoutBlock(irreps_in, MLP_irreps, num_elements)
+        self.gate = gate
+        self.linear_2 = PerElementLinearReadoutBlock(MLP_irreps, irrep_out, num_elements)
+
+    def forward(
+        self,
+        x: torch.Tensor,  # [n_nodes, in_dim]
+        node_attrs: torch.Tensor,  # [n_nodes, num_elements], one-hot
+    ) -> torch.Tensor:  # [n_nodes, out_dim]
+        h = self.gate(self.linear_1(x, node_attrs))
+        return self.linear_2(h, node_attrs)
+
+
 @simplify_if_compile
 @compile_mode("script")
 class NonLinearBiasReadoutBlock(torch.nn.Module):

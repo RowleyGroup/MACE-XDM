@@ -188,6 +188,24 @@ functions). Because M1/M2/M3/Veff are invariant per-atom scalars (not an
 extensive total like energy), the model reads out `num_xdm_targets` (default 4)
 `0e` scalars per atom instead of a single energy.
 
+The equivariant interaction/product-basis body (and every readout but the
+last) is shared across all elements, the same as base MACE's energy model --
+element identity is injected via the one-hot `node_attrs` at several points
+(embedding, skip connections, per-element symmetric-contraction weights), but
+the underlying geometric feature extraction is common to every element,
+letting rare elements benefit from what abundant ones teach the shared
+backbone. The *final* readout, however, is per-element
+(`PerElementLinearReadoutBlock`/`PerElementNonLinearReadoutBlock`): each
+element gets its own dedicated weight matrix at the last layer rather than
+sharing one across all elements. This matters because that last readout is
+fit as a flat average over every atom -- a rare element (a small fraction of
+total atoms) has little influence on a *shared* final layer relative to
+abundant ones, so its fit can be limited by, or even regress toward, whatever
+compromise best suits the abundant elements as training progresses. A
+per-element final layer removes that competition for the last layer's
+capacity specifically, without giving up the shared backbone's benefit for
+everything upstream of it.
+
 Predictions are made in per-element standardized (z-score) units: for each
 chemical element, the network predicts a standardized residual, which is
 mapped back to physical units by `AtomicElementReferenceBlock` via

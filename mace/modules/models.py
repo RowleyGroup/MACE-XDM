@@ -28,6 +28,8 @@ from .blocks import (
     NonLinearDipolePolarReadoutBlock,
     NonLinearDipoleReadoutBlock,
     NonLinearReadoutBlock,
+    PerElementLinearReadoutBlock,
+    PerElementNonLinearReadoutBlock,
     RadialEmbeddingBlock,
     ScaleShiftBlock,
 )
@@ -1544,8 +1546,20 @@ class AtomicXDMMACE(torch.nn.Module):
         )
         self.products = torch.nn.ModuleList([prod])
 
+        # self.readouts holds every non-final layer's (shared) readout;
+        # self.final_readout is the last layer's readout only, kept separate
+        # because -- unlike every other readout here -- it's per-element (see
+        # PerElementLinearReadoutBlock): the last layer's channels are always
+        # scalars-only (see above), so the final readout is where a rare
+        # element's fit is otherwise most exposed to being outweighed by
+        # abundant elements in a single shared set of weights.
         self.readouts = torch.nn.ModuleList()
-        self.readouts.append(LinearReadoutBlock(hidden_irreps_out, readout_irreps))
+        if num_interactions == 1:
+            self.final_readout: torch.nn.Module = PerElementLinearReadoutBlock(
+                hidden_irreps_out, readout_irreps, num_elements=num_elements
+            )
+        else:
+            self.readouts.append(LinearReadoutBlock(hidden_irreps_out, readout_irreps))
 
         for i in range(num_interactions - 1):
             if i == num_interactions - 2:
@@ -1572,10 +1586,12 @@ class AtomicXDMMACE(torch.nn.Module):
             )
             self.products.append(prod)
             if i == num_interactions - 2:
-                self.readouts.append(
-                    NonLinearReadoutBlock(
-                        hidden_irreps_out, MLP_irreps, gate, irrep_out=readout_irreps
-                    )
+                self.final_readout = PerElementNonLinearReadoutBlock(
+                    hidden_irreps_out,
+                    MLP_irreps,
+                    gate,
+                    irrep_out=readout_irreps,
+                    num_elements=num_elements,
                 )
             else:
                 self.readouts.append(LinearReadoutBlock(hidden_irreps, readout_irreps))
@@ -1599,11 +1615,15 @@ class AtomicXDMMACE(torch.nn.Module):
             lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
         )
 
-        # Interactions
+        # Interactions. self.readouts covers every layer except the last (see
+        # __init__); the last layer's readout is self.final_readout, applied
+        # separately below since -- unlike the others -- it's per-element and
+        # needs node_attrs.
         contributions = []
-        for interaction, product, readout in zip(
-            self.interactions, self.products, self.readouts
-        ):
+        num_layers = len(self.interactions)
+        for idx in range(num_layers):
+            interaction = self.interactions[idx]
+            product = self.products[idx]
             node_feats, sc = interaction(
                 node_attrs=data["node_attrs"],
                 node_feats=node_feats,
@@ -1617,8 +1637,12 @@ class AtomicXDMMACE(torch.nn.Module):
                 sc=sc,
                 node_attrs=data["node_attrs"],
             )
+            if idx == num_layers - 1:
+                contribution = self.final_readout(node_feats, data["node_attrs"])
+            else:
+                contribution = self.readouts[idx](node_feats)
             contributions.append(
-                readout(node_feats).view(-1, self.num_xdm_targets)
+                contribution.view(-1, self.num_xdm_targets)
             )  # [n_nodes, num_xdm_targets]
 
         xdm_standardized = torch.sum(
