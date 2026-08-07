@@ -196,21 +196,47 @@ def main():
         triplets = [triplets[i] for i in rng.choice(len(triplets), args.max_triplets, replace=False)]
         logging.info(f"Subsampled to {len(triplets)} triplets")
 
+    sr_supported = set(short_range_model.atomic_numbers.tolist())
+    xdm_supported = set(xdm_z_table.zs)
+    supported = sr_supported & xdm_supported
+
     # Build one graph per structure (3 per triplet), tagged with (triplet_idx, role) so
-    # predictions can be recombined into interaction energies afterwards.
+    # predictions can be recombined into interaction energies afterwards. A triplet with
+    # any atom outside what both models support (e.g. a stray/anomalous atom in one
+    # system's data) is skipped entirely rather than crashing the whole run.
     graphs = []
     tags: List[Tuple[int, str]] = []
     true_energy: Dict[Tuple[int, str], float] = {}
     true_exdm: Dict[Tuple[int, str], float] = {}
+    kept_triplets = []
+    n_skipped = 0
     open_files = {path: h5py.File(path, "r") for path in data_files}
     try:
-        for t_idx, roles in enumerate(triplets):
+        for roles in triplets:
+            structures = {}
             for role in ("complex", "frag1", "frag2"):
                 path, leaf = roles[role]
-                atomic_numbers, positions, energy, e_xdm = _read_structure(
+                structures[role] = _read_structure(
                     open_files[path], leaf, args.species_key, args.coordinates_key,
                     args.energy_key, args.exdm_key,
                 )
+
+            unsupported = {
+                role: sorted(set(atomic_numbers.tolist()) - supported)
+                for role, (atomic_numbers, *_rest) in structures.items()
+            }
+            unsupported = {role: zs for role, zs in unsupported.items() if zs}
+            if unsupported:
+                n_skipped += 1
+                logging.warning(
+                    f"Skipping {roles['complex'][1]!r}: unsupported atomic number(s) "
+                    f"{unsupported} (not covered by both the short-range and XDM models)."
+                )
+                continue
+
+            t_idx = len(kept_triplets)
+            kept_triplets.append(roles)
+            for role, (atomic_numbers, positions, energy, e_xdm) in structures.items():
                 dummy_targets = np.zeros((len(atomic_numbers), 4))
                 graphs.append(
                     build_xdm_atomic_data(
@@ -223,6 +249,9 @@ def main():
     finally:
         for fh in open_files.values():
             fh.close()
+    if n_skipped:
+        logging.warning(f"Skipped {n_skipped}/{len(triplets)} triplet(s) with unsupported elements.")
+    triplets = kept_triplets
 
     loader = DataLoader(graphs, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)
 

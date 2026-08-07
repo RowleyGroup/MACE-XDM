@@ -157,3 +157,44 @@ def test_main_cli_writes_intermolecular_report(tmp_path, monkeypatch):
 
     csv_lines = (output_dir / "intermolecular_predictions.csv").read_text().strip().splitlines()
     assert len(csv_lines) == 5  # header + 4 complexes
+
+
+def test_main_cli_skips_triplet_with_unsupported_element(tmp_path, monkeypatch, caplog):
+    xdm_z_table = AtomicNumberTable([1, 8])
+    xdm_model = _build_xdm_model(xdm_z_table)
+    xdm_path = tmp_path / "xdm.model"
+    torch.save(xdm_model, xdm_path)
+
+    sr_z_table = AtomicNumberTable([1, 8])
+    sr_model = _build_short_range_model(sr_z_table, atomic_energies=[-0.5, -75.0])
+    sr_path = tmp_path / "short_range.model"
+    torch.save(sr_model, sr_path)
+
+    data_path = tmp_path / "data.h5"
+    _write_dataset(data_path, n_complexes=3)
+    # Contaminate one complex with an element neither model supports (mirrors the
+    # real deshaw370k_1183 anomaly: a stray helium atom appended to one structure).
+    with h5py.File(data_path, "r+") as f:
+        grp = f["deshaw_test_xdm"]["complexprefix_1"]
+        del grp["atomic_numbers"]
+        grp.create_dataset("atomic_numbers", data=np.array([8, 1, 1, 8, 1, 2], dtype=np.uint8))
+
+    output_dir = tmp_path / "out"
+    argv = [
+        "mace_eval_intermolecular_xdm",
+        "--short_range_model", str(sr_path),
+        "--xdm_model", str(xdm_path),
+        "--data_files", str(data_path),
+        "--output_dir", str(output_dir),
+        "--no_plots",
+    ]
+    monkeypatch.setattr(sys, "argv", argv)
+    with caplog.at_level("WARNING"):
+        main()
+
+    assert any("Skipping" in r.message and "complexprefix_1" in r.message for r in caplog.records)
+    assert any("Skipped 1/3" in r.message for r in caplog.records)
+
+    report = json.loads((output_dir / "intermolecular_report.json").read_text())
+    for key in report:
+        assert report[key]["n"] == 2  # the contaminated triplet was excluded
