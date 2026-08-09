@@ -83,6 +83,27 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="If set, randomly subsample to at most this many complexes for a quick look.",
     )
+    parser.add_argument(
+        "--min_fragment_atoms",
+        type=int,
+        default=1,
+        help="Skip a triplet if its complex, frag_1, or frag_2 has fewer than this many "
+        "atoms. Default 1 (no filtering). Fragments this small are usually a minimal "
+        "diatomic/monatomic species (e.g. a bare H2) rather than the kind of organic "
+        "fragment the short-range model's training data was actually built from -- the "
+        "model can extrapolate wildly (potentially 100+ kcal/mol errors) on them, which "
+        "dominates aggregate metrics out of proportion to how often such fragments "
+        "actually occur. Try --min_fragment_atoms 3 to exclude diatomics like H2.",
+    )
+    parser.add_argument(
+        "--skip_homonuclear_fragments",
+        action="store_true",
+        help="Skip a triplet if any of its structures consist of a single element only "
+        "(e.g. H2, O2, N2, Cl2) -- a more targeted version of --min_fragment_atoms for "
+        "exactly the failure mode of isolated single-element diatomics/small clusters "
+        "that organic-molecule-derived training data (e.g. ANI-2x-style) typically never "
+        "includes as a standalone fragment.",
+    )
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--output_dir", default="intermolecular_results")
     parser.add_argument("--no_plots", action="store_true")
@@ -210,6 +231,7 @@ def main():
     true_exdm: Dict[Tuple[int, str], float] = {}
     kept_triplets = []
     n_skipped = 0
+    n_skipped_fragment_filter = 0
     open_files = {path: h5py.File(path, "r") for path in data_files}
     try:
         for roles in triplets:
@@ -234,6 +256,26 @@ def main():
                 )
                 continue
 
+            too_small = {
+                role: len(atomic_numbers)
+                for role, (atomic_numbers, *_rest) in structures.items()
+                if len(atomic_numbers) < args.min_fragment_atoms
+            }
+            homonuclear = {
+                role: int(atomic_numbers[0])
+                for role, (atomic_numbers, *_rest) in structures.items()
+                if args.skip_homonuclear_fragments and len(set(atomic_numbers.tolist())) == 1
+            }
+            if too_small or homonuclear:
+                n_skipped_fragment_filter += 1
+                reason = []
+                if too_small:
+                    reason.append(f"below --min_fragment_atoms={args.min_fragment_atoms}: {too_small}")
+                if homonuclear:
+                    reason.append(f"single-element structure(s): {homonuclear}")
+                logging.warning(f"Skipping {roles['complex'][1]!r}: " + "; ".join(reason))
+                continue
+
             t_idx = len(kept_triplets)
             kept_triplets.append(roles)
             for role, (atomic_numbers, positions, energy, e_xdm) in structures.items():
@@ -251,6 +293,11 @@ def main():
             fh.close()
     if n_skipped:
         logging.warning(f"Skipped {n_skipped}/{len(triplets)} triplet(s) with unsupported elements.")
+    if n_skipped_fragment_filter:
+        logging.warning(
+            f"Skipped {n_skipped_fragment_filter}/{len(triplets)} triplet(s) via "
+            f"--min_fragment_atoms/--skip_homonuclear_fragments."
+        )
     triplets = kept_triplets
 
     loader = DataLoader(graphs, batch_size=args.batch_size, shuffle=False, num_workers=args.num_workers)

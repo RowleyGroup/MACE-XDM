@@ -503,6 +503,20 @@ name the QM reference Hartree-unit datasets on each structure;
 a CSV of every complex's true/predicted values, and a scatter plot
 (`--no_plots` to skip).
 
+Aggregate metrics on a large, diverse complex/monomer dataset can be
+dominated by a small number of catastrophic outliers rather than reflecting
+typical performance -- e.g. a short-range model trained on organic-molecule
+data (such as ANI-2x) has essentially no exposure to a bare, isolated
+diatomic like H2 as a standalone fragment, and can mispredict its energy by
+100+ kcal/mol, swamping the RMSE/R² for the other 99.8% of complexes it
+handles well. `--min_fragment_atoms N` skips any triplet whose complex,
+frag_1, or frag_2 has fewer than N atoms (e.g. `--min_fragment_atoms 3`
+excludes diatomics like H2); `--skip_homonuclear_fragments` more
+specifically skips any triplet where a structure consists of a single
+element only (H2, O2, N2, Cl2, ...) regardless of size. Both are opt-in
+(default: no filtering) so the unfiltered numbers -- including whatever such
+outliers are actually in the data -- are always available too.
+
 ## Tutorials
 
 You can run our [Colab tutorial](https://colab.research.google.com/drive/1D6EtMUjQPey_GkuxUAbPgld6_9ibIa-V?authuser=1#scrollTo=Z10787RE1N8T) to quickly get started with MACE.
