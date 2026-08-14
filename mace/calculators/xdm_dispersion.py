@@ -9,9 +9,11 @@ import numpy as np
 import torch
 from ase.calculators.calculator import Calculator, all_changes
 
+from mace.calculators.mace import get_model_dtype
 from mace.data import build_xdm_atomic_data, mlxdm_2x_polarizability_reference
 from mace.modules import MACEXDMDispersion, XDMDispersionEnergy, load_xdm_model
 from mace.tools import AtomicNumberTable, load_full_model
+from mace.tools import torch_tools
 from mace.tools.torch_geometric.batch import Batch
 
 
@@ -51,6 +53,15 @@ class MACEXDMDispersionCalculator(Calculator):
         short_range_model = load_full_model(short_range_model_path, device=self.device)
         xdm_model = load_xdm_model(xdm_model_path, device=self.device)
 
+        self.default_dtype = get_model_dtype(short_range_model)
+        xdm_dtype = get_model_dtype(xdm_model)
+        if xdm_dtype != self.default_dtype:
+            xdm_model = (
+                xdm_model.double()
+                if self.default_dtype == "float64"
+                else xdm_model.float()
+            )
+
         xdm_z_table = AtomicNumberTable(xdm_model.atomic_numbers.tolist())
         if alpha_free is None or v_free is None:
             ref = mlxdm_2x_polarizability_reference(xdm_z_table)
@@ -74,17 +85,18 @@ class MACEXDMDispersionCalculator(Calculator):
         Calculator.calculate(self, atoms)
 
         targets = np.zeros((len(atoms), 4))
-        graph = build_xdm_atomic_data(
-            atomic_numbers=atoms.get_atomic_numbers(),
-            positions=atoms.get_positions(),
-            xdm_targets=targets,
-            z_table=self.z_table,
-            cutoff=self.r_max,
-        )
-        batch = Batch.from_data_list([graph]).to(self.device)
-        data = batch.to_dict()
+        with torch_tools.default_dtype(self.default_dtype):
+            graph = build_xdm_atomic_data(
+                atomic_numbers=atoms.get_atomic_numbers(),
+                positions=atoms.get_positions(),
+                xdm_targets=targets,
+                z_table=self.z_table,
+                cutoff=self.r_max,
+            )
+            batch = Batch.from_data_list([graph]).to(self.device)
+            data = batch.to_dict()
 
-        out = self.model(data, training=False, compute_force=True)
+            out = self.model(data, training=False, compute_force=True)
 
         energy = float(out["energy"].detach().cpu().numpy()[0])
         forces = out["forces"].detach().cpu().numpy()
