@@ -628,7 +628,12 @@ def prepare_graph(
         lengths = torch.linalg.vector_norm(vectors, dim=1, keepdim=True)
         ikw = InteractionKwargs(data["lammps_class"], (n_real, n_ghost))
     else:
-        if not torch.compiler.is_compiling():
+        try:
+            is_compiling = torch.compiler.is_compiling()
+        except AttributeError:
+            is_compiling = False
+
+        if not is_compiling:
             data["positions"].requires_grad_(True)
         positions = data["positions"]
         cell = data["cell"]
