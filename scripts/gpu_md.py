@@ -351,6 +351,86 @@ def velocity_verlet(
 
 
 # ---------------------------------------------------------------------------
+# Langevin NVT integrator, following ase.md.langevin.Langevin (itself Eq. 23
+# of Vanden-Eijnden & Ciccotti, Chem. Phys. Lett. 429, 310 (2006)), adapted
+# to run purely on `system`'s torch tensors. ASE's coefficients are derived
+# in a unit system where energy/mass is directly velocity^2 and force/mass is
+# directly acceleration; here those two conversions are made explicit via
+# `KE_FACTOR` and `ACC_FACTOR` (see the unit-system block at the top of this
+# file) everywhere ASE relies on them implicitly.
+# ---------------------------------------------------------------------------
+def langevin(
+    system: System,
+    dt_fs: float,
+    n_steps: int,
+    temperature_K: float,
+    friction: float,
+    fixcm: bool = True,
+    seed: Optional[int] = None,
+    callback: Optional[Callable[[int, float, float, float], None]] = None,
+) -> None:
+    """Langevin (NVT) integrator.
+
+    `friction` is the friction coefficient in 1/fs (matching this file's
+    fs-based time unit -- pass e.g. `0.01` for a relaxation time of 100 fs).
+    `fixcm`, if True, corrects the per-step random position/velocity kicks so
+    they carry zero net momentum and zero net center-of-mass displacement, as
+    in ASE's `Langevin(..., fixcm=True)`.
+    """
+    gen = torch.Generator(device="cpu")
+    if seed is not None:
+        gen.manual_seed(seed)
+
+    masses = system.masses.unsqueeze(-1)
+    temp = KB_EV * temperature_K
+    sigma = torch.sqrt(2.0 * friction * temp / (masses * KE_FACTOR))
+
+    c1 = dt_fs / 2.0 - dt_fs**2 * friction / 8.0
+    c2 = dt_fs * friction / 2.0 - dt_fs**2 * friction**2 / 8.0
+    c3 = np.sqrt(dt_fs) * sigma / 2.0 - dt_fs**1.5 * friction * sigma / 8.0
+    c5 = dt_fs**1.5 * sigma / (2.0 * np.sqrt(3.0))
+    c4 = friction / 2.0 * c5
+
+    def random_kicks() -> Tuple[torch.Tensor, torch.Tensor]:
+        xi = torch.randn((system.n_atoms, 3), generator=gen).to(system.device)
+        eta = torch.randn((system.n_atoms, 3), generator=gen).to(system.device)
+        rnd_pos = c5 * eta
+        rnd_vel = c3 * xi - c4 * eta
+        if fixcm and system.n_atoms > 1:
+            factor = (system.n_atoms / (system.n_atoms - 1.0)) ** 0.5
+            rnd_pos = rnd_pos - rnd_pos.sum(dim=0) / system.n_atoms
+            rnd_vel = rnd_vel - (rnd_vel * masses).sum(dim=0) / (masses * system.n_atoms)
+            rnd_pos = rnd_pos * factor
+            rnd_vel = rnd_vel * factor
+        return rnd_pos, rnd_vel
+
+    energy, forces, _ = system.energy_forces()
+    for step in range(n_steps):
+        if callback is not None:
+            e_kin = system.kinetic_energy()
+            callback(step, energy, e_kin, system.temperature())
+
+        rnd_pos, rnd_vel = random_kicks()
+
+        accel = system.accelerations(forces)
+        system.velocities = (
+            system.velocities + c1 * accel - c2 * system.velocities + rnd_vel
+        )
+
+        x = system.positions.clone()
+        system.positions = x + dt_fs * system.velocities + rnd_pos
+        system.velocities = (system.positions - x - rnd_pos) / dt_fs
+
+        system.maybe_rebuild_neighbors()
+        energy, forces, _ = system.energy_forces()
+        accel = system.accelerations(forces)
+
+        system.velocities = (
+            system.velocities + c1 * accel - c2 * system.velocities + rnd_vel
+        )
+
+
+# ---------------------------------------------------------------------------
 # CLI demo
 # ---------------------------------------------------------------------------
 def main() -> None:
@@ -363,6 +443,7 @@ def main() -> None:
     parser.add_argument("--md-steps", type=int, default=200)
     parser.add_argument("--dt", type=float, default=1.0, help="MD timestep, fs")
     parser.add_argument("--temperature", type=float, default=300.0, help="Initial temperature, K")
+    parser.add_argument("--friction", type=float, default=0.01, help="Langevin friction, 1/fs")
     parser.add_argument("--seed", type=int, default=0)
     args = parser.parse_args()
 
@@ -408,6 +489,17 @@ def main() -> None:
             )
 
     velocity_verlet(system, dt_fs=args.dt, n_steps=args.md_steps, callback=md_cb)
+
+    print("\n--- Langevin MD (NVT) ---")
+    langevin(
+        system,
+        dt_fs=args.dt,
+        n_steps=args.md_steps,
+        temperature_K=args.temperature,
+        friction=args.friction,
+        seed=args.seed,
+        callback=md_cb,
+    )
 
 
 if __name__ == "__main__":

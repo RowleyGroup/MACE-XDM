@@ -1,6 +1,6 @@
-"""Tests for the ASE-free GPU minimization / velocity-Verlet MD helpers in
-scripts/gpu_md.py. Uses a small randomly-initialized MACE model (no
-foundation-model checkpoint needed) so the suite stays fast."""
+"""Tests for the ASE-free GPU minimization / velocity-Verlet / Langevin MD
+helpers in scripts/gpu_md.py. Uses a small randomly-initialized MACE model
+(no foundation-model checkpoint needed) so the suite stays fast."""
 
 import numpy as np
 import pytest
@@ -12,6 +12,7 @@ from mace import modules, tools
 from scripts.gpu_md import (
     System,
     init_maxwell_boltzmann,
+    langevin,
     minimize_fire,
     read_xyz,
     velocity_verlet,
@@ -161,6 +162,69 @@ def test_velocity_verlet_conserves_energy(tiny_model):
     total_energies = np.array(total_energies)
     # Total energy should be conserved to well within 1% of its scale.
     assert total_energies.std() < 1e-2 * abs(total_energies.mean())
+
+
+def test_langevin_zero_friction_matches_velocity_verlet(tiny_model):
+    """At friction=0 the Langevin random kicks vanish and its coefficients
+    reduce exactly to the velocity-Verlet half-step update, so the two
+    integrators should produce identical trajectories."""
+    atomic_numbers, positions, cell = oxygen_box()
+    system_vv = System(
+        tiny_model, atomic_numbers, positions, cell=cell, pbc=(True, True, True), device="cpu"
+    )
+    torch.manual_seed(0)
+    init_maxwell_boltzmann(system_vv, temperature_K=300.0, seed=0)
+
+    system_lgv = System(
+        tiny_model, atomic_numbers, positions, cell=cell, pbc=(True, True, True), device="cpu"
+    )
+    system_lgv.velocities = system_vv.velocities.clone()
+
+    velocity_verlet(system_vv, dt_fs=0.5, n_steps=20)
+    langevin(
+        system_lgv,
+        dt_fs=0.5,
+        n_steps=20,
+        temperature_K=300.0,
+        friction=0.0,
+        fixcm=False,
+        seed=1,
+    )
+
+    np.testing.assert_allclose(
+        system_lgv.positions.numpy(), system_vv.positions.numpy(), atol=1e-10
+    )
+    np.testing.assert_allclose(
+        system_lgv.velocities.numpy(), system_vv.velocities.numpy(), atol=1e-10
+    )
+
+
+def test_langevin_thermostats_towards_target_temperature(tiny_model):
+    atomic_numbers, positions, cell = oxygen_box()
+    system = System(
+        tiny_model, atomic_numbers, positions, cell=cell, pbc=(True, True, True), device="cpu"
+    )
+
+    target_t = 300.0
+    temperatures = []
+
+    def cb(step, e_pot, e_kin, temperature):
+        if step >= 200:
+            temperatures.append(temperature)
+
+    langevin(
+        system,
+        dt_fs=0.5,
+        n_steps=1000,
+        temperature_K=target_t,
+        friction=0.05,
+        seed=0,
+        callback=cb,
+    )
+
+    assert all(np.isfinite(system.positions.numpy()).ravel())
+    mean_t = np.mean(temperatures)
+    assert 0.3 * target_t < mean_t < 3.0 * target_t
 
 
 def test_neighbor_list_skin_rebuild(tiny_model):
