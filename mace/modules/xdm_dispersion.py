@@ -6,19 +6,31 @@
 # Formulas and reference constants transcribed from RowleyGroup/MLXDM
 # (torchanipbe0/dispersion/nn.py: C6/C8/C10CombineLayer, PolarizabilityLayer,
 # vanderWaalsLayer, EnergyLayer). Operates on whole (finite, non-periodic)
-# molecules via a dense pairwise distance matrix masked by graph membership
-# and cutoff, rather than a fixed-radius neighbor list -- appropriate since
-# the dispersion cutoff (14 A by default) is much larger than a typical
-# short-range MACE cutoff, and molecules in this dataset are small enough
-# (tens to a couple hundred atoms) that an O(n_atoms^2) distance matrix is
-# cheap relative to either neural network's forward pass.
+# molecules, matched into pairs by graph membership and cutoff.
+#
+# For small structures (the typical training case: batches of independent
+# molecules of up to a few hundred atoms each) pairs are found via a dense
+# [n_nodes, n_nodes] distance matrix -- cheap relative to either neural
+# network's forward pass, and simplest to keep exactly-differentiable.
+#
+# Above _DENSE_MAX_NODES, that dense matrix (and the same-sized boolean masks
+# built alongside it) becomes the dominant memory cost -- O(n_nodes^2) -- which
+# matters once this module is driven by an MD loop over a single large (e.g.
+# multi-hundred to multi-thousand atom) structure rather than a batch of small
+# ones. Above the threshold, pairs are instead found with a cell-list neighbor
+# search (matscipy, the same backend `mace.data.neighborhood.get_neighborhood`
+# uses for the short-range MACE cutoff), run once per graph on CPU -- giving
+# memory that scales with the true number of within-cutoff pairs instead of
+# with n_nodes^2. The per-pair energy formulas afterwards are identical in
+# both cases; only how (idx_i, idx_j, r) are produced differs.
 ###########################################################################################
 
-from typing import Dict, Union
+from typing import Dict, List, Tuple, Union
 
 import numpy as np
 import torch
 
+from mace.data.neighborhood import get_neighborhood
 from mace.tools.scatter import scatter_sum
 
 BOHR_TO_ANGSTROM = 0.529177249
@@ -44,6 +56,10 @@ class XDMDispersionEnergy(torch.nn.Module):
     alpha_free: torch.Tensor
     v_free: torch.Tensor
 
+    # Above this many nodes, switch pair-finding from a dense [n,n] distance
+    # matrix to a cell-list neighbor search (see module docstring).
+    _DENSE_MAX_NODES = 512
+
     def __init__(
         self,
         alpha_free: Union[np.ndarray, torch.Tensor],
@@ -64,6 +80,66 @@ class XDMDispersionEnergy(torch.nn.Module):
         self.register_buffer(
             "bohr_to_angstrom", torch.tensor(BOHR_TO_ANGSTROM, dtype=torch.get_default_dtype())
         )
+
+    def _dense_pairs(
+        self, positions: torch.Tensor, batch: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pair-finding via a dense [n,n] distance matrix. O(n_nodes^2) memory
+        -- only used below _DENSE_MAX_NODES nodes (see module docstring)."""
+        n_nodes = positions.shape[0]
+        diff = positions.unsqueeze(1) - positions.unsqueeze(0)  # [n,n,3]
+        dist = torch.linalg.norm(diff, dim=-1)  # [n,n]
+
+        same_graph = batch.unsqueeze(1) == batch.unsqueeze(0)
+        upper = torch.triu(
+            torch.ones(n_nodes, n_nodes, dtype=torch.bool, device=positions.device),
+            diagonal=1,
+        )
+        within_cutoff = dist < self.cutoff
+        mask = same_graph & upper & within_cutoff
+
+        idx_i, idx_j = torch.nonzero(mask, as_tuple=True)
+        r = dist[idx_i, idx_j]
+        return idx_i, idx_j, r
+
+    def _sparse_pairs(
+        self, positions: torch.Tensor, batch: torch.Tensor, num_graphs: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Pair-finding via a per-graph cell-list neighbor search (CPU,
+        matscipy). Memory scales with the number of within-cutoff pairs
+        rather than n_nodes^2 -- used above _DENSE_MAX_NODES nodes."""
+        cutoff = float(self.cutoff.item())
+        positions_np = positions.detach().cpu().numpy()
+        batch_np = batch.detach().cpu().numpy()
+
+        all_i: List[torch.Tensor] = []
+        all_j: List[torch.Tensor] = []
+        for g in range(num_graphs):
+            node_idx_np = np.nonzero(batch_np == g)[0]
+            if node_idx_np.size < 2:
+                continue
+            edge_index, _, _, _ = get_neighborhood(
+                positions=positions_np[node_idx_np], cutoff=cutoff
+            )
+            sender, receiver = edge_index[0], edge_index[1]
+            keep = sender < receiver  # one direction per pair, like triu(diagonal=1)
+            if not keep.any():
+                continue
+            node_idx = torch.as_tensor(node_idx_np, dtype=torch.long)
+            sender = torch.as_tensor(sender[keep], dtype=torch.long)
+            receiver = torch.as_tensor(receiver[keep], dtype=torch.long)
+            all_i.append(node_idx[sender])
+            all_j.append(node_idx[receiver])
+
+        if not all_i:
+            empty = torch.empty(0, dtype=torch.long, device=positions.device)
+            return empty, empty, positions.new_zeros(0)
+
+        idx_i = torch.cat(all_i).to(positions.device)
+        idx_j = torch.cat(all_j).to(positions.device)
+        diff = positions[idx_i] - positions[idx_j]  # [n_pairs, 3]
+        r = torch.linalg.norm(diff, dim=-1)  # [n_pairs]
+        return idx_i, idx_j, r
 
     def forward(
         self,
@@ -87,25 +163,17 @@ class XDMDispersionEnergy(torch.nn.Module):
         alpha = veff * alpha_free_atom / v_free_atom  # [n_nodes]
 
         n_nodes = positions.shape[0]
-        diff = positions.unsqueeze(1) - positions.unsqueeze(0)  # [n,n,3]
-        dist = torch.linalg.norm(diff, dim=-1)  # [n,n]
+        if n_nodes > self._DENSE_MAX_NODES:
+            idx_i, idx_j, r = self._sparse_pairs(positions, batch, num_graphs)
+        else:
+            idx_i, idx_j, r = self._dense_pairs(positions, batch)
 
-        same_graph = batch.unsqueeze(1) == batch.unsqueeze(0)
-        upper = torch.triu(
-            torch.ones(n_nodes, n_nodes, dtype=torch.bool, device=positions.device),
-            diagonal=1,
-        )
-        within_cutoff = dist < self.cutoff
-        mask = same_graph & upper & within_cutoff
-
-        idx_i, idx_j = torch.nonzero(mask, as_tuple=True)
         if idx_i.numel() == 0:
             zeros = torch.zeros(num_graphs, dtype=positions.dtype, device=positions.device)
             if return_components:
                 return {"total": zeros, "e6": zeros, "e8": zeros, "e10": zeros}
             return zeros
 
-        r = dist[idx_i, idx_j]
         m1_i, m1_j = m1[idx_i], m1[idx_j]
         m2_i, m2_j = m2[idx_i], m2[idx_j]
         m3_i, m3_j = m3[idx_i], m3[idx_j]
