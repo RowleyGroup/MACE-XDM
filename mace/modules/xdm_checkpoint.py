@@ -10,7 +10,7 @@ from typing import Dict, Union
 import torch
 from e3nn import o3
 
-from mace.modules.wrapper_ops import OEQConfig
+from mace.modules.wrapper_ops import CuEquivarianceConfig, OEQConfig
 from mace.tools import AtomicNumberTable, safe_jit_load_map_location
 
 from . import gate_dict, interaction_classes
@@ -29,13 +29,22 @@ def build_atomic_xdm_mace_from_args(
     ``"args"`` entry), so training and checkpoint-loading always build an
     identical architecture from a single source of truth.
 
-    ``args["enable_oeq"]`` (default False, for checkpoints saved before this
-    option existed) builds the model with openequivariance-accelerated
-    tensor-product kernels instead of plain e3nn -- see --enable_oeq's help
-    in run_train_xdm.py for what that implies for loading the result later.
+    ``args["enable_cueq"]``/``args["enable_oeq"]`` (both default False, for
+    checkpoints saved before these options existed) build the model with
+    cuequivariance- or openequivariance-accelerated tensor-product kernels
+    instead of plain e3nn -- see --enable_cueq/--enable_oeq's help in
+    run_train_xdm.py for what that implies for loading the result later.
+    Mutually exclusive; run_train_xdm.py's main() resolves both-set to cueq
+    before this is called, so here it's cueq-takes-priority as a fallback.
     """
+    cueq_config = None
     oeq_config = None
-    if args.get("enable_oeq"):
+    if args.get("enable_cueq"):
+        cueq_config = CuEquivarianceConfig(
+            enabled=True, layout="ir_mul", group="O3_e3nn", optimize_all=True,
+            conv_fusion=True,
+        )
+    elif args.get("enable_oeq"):
         oeq_config = OEQConfig(enabled=True, optimize_all=True)
     return AtomicXDMMACE(
         r_max=args["r_max"],
@@ -55,6 +64,7 @@ def build_atomic_xdm_mace_from_args(
         element_means=element_means,
         element_stds=element_stds,
         num_xdm_targets=len(args["target_keys"]),
+        cueq_config=cueq_config,
         oeq_config=oeq_config,
     )
 
