@@ -39,6 +39,7 @@ from mace.tools import (
     set_seeds,
     setup_logger,
 )
+from mace.tools.arg_parser import str2bool
 from mace.tools.torch_geometric.dataloader import DataLoader
 from mace.tools.torch_tools import to_numpy
 
@@ -158,6 +159,20 @@ def build_parser() -> argparse.ArgumentParser:
         type=float,
         default=None,
         help="If omitted, computed from the training set.",
+    )
+    parser.add_argument(
+        "--enable_oeq",
+        type=str2bool,
+        default=False,
+        help="Build AtomicXDMMACE with openequivariance-accelerated tensor-product "
+        "kernels (mace.modules.wrapper_ops.OEQConfig), instead of plain e3nn. Needs "
+        "the `openequivariance` package installed -- supports both NVIDIA CUDA and "
+        "AMD ROCm/HIP, unlike cuequivariance (CUDA-only), so it's the option to use "
+        "for training on AMD GPUs. Saved checkpoints/models built this way require "
+        "openequivariance to be installed wherever they're loaded again, including "
+        "for inference -- there is currently no conversion back to a plain-e3nn, "
+        "dependency-free .model file for AtomicXDMMACE (unlike the base MACE model, "
+        "see mace/cli/convert_oeq_e3nn.py, which does not yet support this class).",
     )
 
     # Optimization

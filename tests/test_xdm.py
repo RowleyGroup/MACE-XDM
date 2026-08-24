@@ -26,6 +26,13 @@ try:
 except ImportError:
     CUET_AVAILABLE = False
 
+try:
+    import openequivariance as oeq  # pylint: disable=unused-import
+
+    OEQ_AVAILABLE = True
+except ImportError:
+    OEQ_AVAILABLE = False
+
 torch.set_default_dtype(torch.float64)
 
 SYMBOL_TO_Z = {"H": 1, "C": 6, "N": 7, "O": 8}
@@ -220,6 +227,57 @@ def test_atomic_xdm_mace_accepts_cueq_config():
     xdm_atomic.sum().backward()
     assert torch.isfinite(data["positions"].grad).all()
     assert (data["positions"].grad.abs() > 0).any()
+
+
+@pytest.mark.skipif(not OEQ_AVAILABLE, reason="openequivariance not installed")
+def test_run_train_xdm_enable_oeq_builds_accelerated_model():
+    """run_train_xdm.py's --enable_oeq flag must reach AtomicXDMMACE's
+    interaction blocks via build_atomic_xdm_mace_from_args -- openequivariance
+    supports AMD ROCm/HIP as well as NVIDIA CUDA (unlike cuequivariance, which
+    is CUDA-only), so it's the option to use when training on AMD GPUs."""
+    from mace.modules.xdm_checkpoint import build_atomic_xdm_mace_from_args
+
+    z_table = AtomicNumberTable([1, 6, 8])
+    n_elements = len(z_table)
+    rng = np.random.RandomState(0)
+    args = dict(
+        r_max=5.0,
+        num_bessel=8,
+        num_polynomial_cutoff=5,
+        max_ell=2,
+        interaction="RealAgnosticResidualInteractionBlock",
+        interaction_first="RealAgnosticInteractionBlock",
+        num_interactions=2,
+        hidden_irreps="16x0e + 16x1o",
+        MLP_irreps="16x0e",
+        correlation=2,
+        gate="silu",
+        target_keys=["M1", "M2", "M3", "Veff"],
+        enable_oeq=True,
+    )
+    model = build_atomic_xdm_mace_from_args(
+        args=args,
+        z_table=z_table,
+        avg_num_neighbors=3.0,
+        element_means=rng.rand(n_elements, 4) + 1.0,
+        element_stds=rng.rand(n_elements, 4) * 0.1 + 0.1,
+    )
+    assert model.interactions[0].oeq_config is not None
+    assert model.interactions[0].oeq_config.enabled
+    assert model.interactions[1].oeq_config is not None
+    assert model.interactions[1].oeq_config.enabled
+
+    # args without "enable_oeq" at all (checkpoints saved before this option
+    # existed) must still build -- default to disabled, not a KeyError.
+    old_args = {k: v for k, v in args.items() if k != "enable_oeq"}
+    old_model = build_atomic_xdm_mace_from_args(
+        args=old_args,
+        z_table=z_table,
+        avg_num_neighbors=3.0,
+        element_means=rng.rand(n_elements, 4) + 1.0,
+        element_stds=rng.rand(n_elements, 4) * 0.1 + 0.1,
+    )
+    assert old_model.interactions[0].oeq_config is None
 
 
 def test_atomic_xdm_mace_forward_shapes():
