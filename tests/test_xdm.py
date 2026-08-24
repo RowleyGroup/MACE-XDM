@@ -229,6 +229,71 @@ def test_atomic_xdm_mace_accepts_cueq_config():
     assert (data["positions"].grad.abs() > 0).any()
 
 
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_run_train_xdm_enable_cueq_builds_accelerated_model():
+    """run_train_xdm.py's --enable_cueq flag must reach AtomicXDMMACE's
+    interaction blocks via build_atomic_xdm_mace_from_args, and the resulting
+    model must actually run (forward + backward), not just construct --
+    cuequivariance is NVIDIA-only but ships precompiled kernels, so it's the
+    option to use when training on NVIDIA GPUs (e.g. A100), preferred over
+    --enable_oeq there since there's no JIT-compile step to hang on."""
+    from mace.modules.xdm_checkpoint import build_atomic_xdm_mace_from_args
+
+    z_table = AtomicNumberTable([1, 6, 8])
+    n_elements = len(z_table)
+    rng = np.random.RandomState(0)
+    args = dict(
+        r_max=5.0,
+        num_bessel=8,
+        num_polynomial_cutoff=5,
+        max_ell=2,
+        interaction="RealAgnosticResidualInteractionBlock",
+        interaction_first="RealAgnosticInteractionBlock",
+        num_interactions=2,
+        hidden_irreps="16x0e + 16x1o",
+        MLP_irreps="16x0e",
+        correlation=2,
+        gate="silu",
+        target_keys=["M1", "M2", "M3", "Veff"],
+        enable_cueq=True,
+    )
+    model = build_atomic_xdm_mace_from_args(
+        args=args,
+        z_table=z_table,
+        avg_num_neighbors=3.0,
+        element_means=rng.rand(n_elements, 4) + 1.0,
+        element_stds=rng.rand(n_elements, 4) * 0.1 + 0.1,
+    )
+    assert model.interactions[0].cueq_config is not None
+    assert model.interactions[0].cueq_config.enabled
+    assert model.interactions[1].oeq_config is None  # cueq and oeq are exclusive
+
+    atomic_numbers = np.array([8, 1, 1])
+    positions = np.array([[0.0, -2.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    targets = np.zeros((3, 4))
+    graph = build_xdm_atomic_data(atomic_numbers, positions, targets, z_table, cutoff=3.0)
+    data = Batch.from_data_list([graph]).to_dict()
+    data["positions"].requires_grad_(True)
+
+    output = model(data)
+    xdm_atomic = output["xdm_atomic"]
+    assert torch.isfinite(xdm_atomic).all()
+    xdm_atomic.sum().backward()
+    assert torch.isfinite(data["positions"].grad).all()
+
+    # both flags set at once must resolve to cueq, not raise.
+    both_args = dict(args, enable_oeq=True)
+    both_model = build_atomic_xdm_mace_from_args(
+        args=both_args,
+        z_table=z_table,
+        avg_num_neighbors=3.0,
+        element_means=rng.rand(n_elements, 4) + 1.0,
+        element_stds=rng.rand(n_elements, 4) * 0.1 + 0.1,
+    )
+    assert both_model.interactions[0].cueq_config is not None
+    assert both_model.interactions[0].oeq_config is None
+
+
 @pytest.mark.skipif(not OEQ_AVAILABLE, reason="openequivariance not installed")
 def test_run_train_xdm_enable_oeq_builds_accelerated_model():
     """run_train_xdm.py's --enable_oeq flag must reach AtomicXDMMACE's

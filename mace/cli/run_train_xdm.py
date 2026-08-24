@@ -161,6 +161,22 @@ def build_parser() -> argparse.ArgumentParser:
         help="If omitted, computed from the training set.",
     )
     parser.add_argument(
+        "--enable_cueq",
+        type=str2bool,
+        default=False,
+        help="Build AtomicXDMMACE with cuequivariance-accelerated tensor-product "
+        "kernels (mace.modules.wrapper_ops.CuEquivarianceConfig), instead of plain "
+        "e3nn. Needs `cuequivariance`, `cuequivariance-torch`, and a CUDA-version- "
+        "matched `cuequivariance-ops-torch-cuXX` package installed -- NVIDIA CUDA "
+        "only (use --enable_oeq instead on AMD/ROCm). Ships precompiled kernels, so "
+        "unlike --enable_oeq there's no JIT-compile step at model-construction time. "
+        "Saved checkpoints/models built this way require cuequivariance to be "
+        "installed wherever they're loaded again, including for inference -- there "
+        "is currently no conversion back to a plain-e3nn, dependency-free .model "
+        "file for AtomicXDMMACE (unlike the base MACE model, see "
+        "mace/cli/convert_cueq_e3nn.py, which does not yet support this class).",
+    )
+    parser.add_argument(
         "--enable_oeq",
         type=str2bool,
         default=False,
@@ -172,7 +188,8 @@ def build_parser() -> argparse.ArgumentParser:
         "openequivariance to be installed wherever they're loaded again, including "
         "for inference -- there is currently no conversion back to a plain-e3nn, "
         "dependency-free .model file for AtomicXDMMACE (unlike the base MACE model, "
-        "see mace/cli/convert_oeq_e3nn.py, which does not yet support this class).",
+        "see mace/cli/convert_oeq_e3nn.py, which does not yet support this class). "
+        "Mutually exclusive with --enable_cueq; if both are set, cueq wins.",
     )
 
     # Optimization
@@ -473,6 +490,13 @@ def main():
     if avg_num_neighbors is None:
         avg_num_neighbors = compute_avg_num_neighbors(train_loader)
     logging.info(f"Average number of neighbors: {avg_num_neighbors:.3f}")
+
+    if args.enable_cueq and args.enable_oeq:
+        logging.warning(
+            "Both --enable_cueq and --enable_oeq are set; using cueq. Pass only "
+            "one of the two."
+        )
+        args.enable_oeq = False
 
     model = build_atomic_xdm_mace_from_args(
         args=vars(args),
