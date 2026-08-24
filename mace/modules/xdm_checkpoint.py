@@ -10,6 +10,7 @@ from typing import Dict, Union
 import torch
 from e3nn import o3
 
+from mace.modules.wrapper_ops import OEQConfig
 from mace.tools import AtomicNumberTable, safe_jit_load_map_location
 
 from . import gate_dict, interaction_classes
@@ -27,7 +28,15 @@ def build_atomic_xdm_mace_from_args(
     run_train_xdm.py's argparse produces (``vars(args)``/checkpoint's
     ``"args"`` entry), so training and checkpoint-loading always build an
     identical architecture from a single source of truth.
+
+    ``args["enable_oeq"]`` (default False, for checkpoints saved before this
+    option existed) builds the model with openequivariance-accelerated
+    tensor-product kernels instead of plain e3nn -- see --enable_oeq's help
+    in run_train_xdm.py for what that implies for loading the result later.
     """
+    oeq_config = None
+    if args.get("enable_oeq"):
+        oeq_config = OEQConfig(enabled=True, optimize_all=True)
     return AtomicXDMMACE(
         r_max=args["r_max"],
         num_bessel=args["num_bessel"],
@@ -46,6 +55,7 @@ def build_atomic_xdm_mace_from_args(
         element_means=element_means,
         element_stds=element_stds,
         num_xdm_targets=len(args["target_keys"]),
+        oeq_config=oeq_config,
     )
 
 
