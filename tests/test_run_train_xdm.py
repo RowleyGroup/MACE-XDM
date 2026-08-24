@@ -1,9 +1,14 @@
 import argparse
+from functools import partial
 
 import h5py
 import numpy as np
+import torch
 
-from mace.cli.run_train_xdm import split_molecule_names
+from mace.cli.run_train_xdm import dataloader_worker_init_fn, split_molecule_names
+from mace.data.xdm import XDMHDF5Dataset
+from mace.tools import AtomicNumberTable, set_default_dtype
+from mace.tools.torch_geometric.dataloader import DataLoader
 
 SYMBOL_TO_Z = {"H": 1, "C": 6, "O": 8}
 
@@ -80,3 +85,45 @@ def test_split_molecule_names_explicit_test_files_excluded_from_train(tmp_path):
     # train pool (10) split further into valid_fraction/(1-valid_fraction) since
     # test came from a separate file and wasn't part of the train-file pool
     assert set(names["train"]) | set(names["valid"]) == {f"trainmol_{i}" for i in range(10)}
+
+
+def test_dataloader_worker_init_fn_fixes_node_attrs_dtype_under_spawn(tmp_path):
+    # torch.set_default_dtype() is per-process global state; under the
+    # "spawn" multiprocessing context, DataLoader worker subprocesses are
+    # fresh interpreters that don't inherit it, so AtomicData built inside
+    # XDMHDF5Dataset.__getitem__ (node_attrs, positions, etc., all built via
+    # torch.get_default_dtype()) silently comes out float32 unless each
+    # worker re-applies the requested default dtype itself.
+    path = _write_master_file(tmp_path / "master.h5", n_molecules=4)
+    z_table = AtomicNumberTable([1, 6, 8])
+    dataset = XDMHDF5Dataset(str(path), z_table=z_table, r_max=5.0)
+
+    original_dtype = torch.get_default_dtype()
+    try:
+        set_default_dtype("float64")
+
+        loader_without_fix = DataLoader(
+            dataset,
+            batch_size=2,
+            num_workers=2,
+            multiprocessing_context="spawn",
+        )
+        batch = next(iter(loader_without_fix))
+        assert batch.node_attrs.dtype == torch.float32, (
+            "expected the pre-fix bug to reproduce here (worker didn't "
+            "inherit float64); if this fails, the underlying multiprocessing "
+            "dtype-inheritance behavior this test targets may have changed"
+        )
+
+        loader_with_fix = DataLoader(
+            dataset,
+            batch_size=2,
+            num_workers=2,
+            multiprocessing_context="spawn",
+            worker_init_fn=partial(dataloader_worker_init_fn, default_dtype="float64"),
+        )
+        batch = next(iter(loader_with_fix))
+        assert batch.node_attrs.dtype == torch.float64
+        assert batch.positions.dtype == torch.float64
+    finally:
+        torch.set_default_dtype(original_dtype)

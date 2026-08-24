@@ -8,6 +8,7 @@ import glob
 import json
 import logging
 import time
+from functools import partial
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -330,6 +331,16 @@ def split_molecule_names(
     return {"train": train_names, "valid": valid_names, "test": test_names}
 
 
+def dataloader_worker_init_fn(_worker_id: int, default_dtype: str) -> None:
+    # torch.set_default_dtype() is per-process global state set once in
+    # main(); DataLoader worker subprocesses don't reliably inherit it (e.g.
+    # under the "spawn" start method), so AtomicData built inside
+    # HDF5Dataset.__getitem__ (node_attrs via to_one_hot(), etc.) can silently
+    # come out float32 even when --default_dtype float64 was requested.
+    # Re-apply it in each worker.
+    set_default_dtype(default_dtype)
+
+
 def batch_loss_and_metrics(
     model: AtomicXDMMACE,
     batch,
@@ -464,12 +475,15 @@ def main():
         f"test conformers: {len(test_dataset)}"
     )
 
+    worker_init_fn = partial(dataloader_worker_init_fn, default_dtype=args.default_dtype)
+
     train_loader = DataLoader(
         train_dataset,
         batch_size=args.batch_size,
         shuffle=True,
         drop_last=False,
         num_workers=args.num_workers,
+        worker_init_fn=worker_init_fn,
     )
     valid_loader = DataLoader(
         valid_dataset,
@@ -477,6 +491,7 @@ def main():
         shuffle=False,
         drop_last=False,
         num_workers=args.num_workers,
+        worker_init_fn=worker_init_fn,
     )
     test_loader = DataLoader(
         test_dataset,
@@ -484,6 +499,7 @@ def main():
         shuffle=False,
         drop_last=False,
         num_workers=args.num_workers,
+        worker_init_fn=worker_init_fn,
     )
 
     avg_num_neighbors = args.avg_num_neighbors
