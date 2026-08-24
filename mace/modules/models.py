@@ -1473,6 +1473,8 @@ class AtomicXDMMACE(torch.nn.Module):
         num_xdm_targets: int = 4,
         radial_type: Optional[str] = "bessel",
         radial_MLP: Optional[List[int]] = None,
+        cueq_config: Optional[Dict[str, Any]] = None,
+        oeq_config: Optional[Dict[str, Any]] = None,
     ):
         super().__init__()
         self.register_buffer(
@@ -1488,7 +1490,9 @@ class AtomicXDMMACE(torch.nn.Module):
         node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
         node_feats_irreps = o3.Irreps([(hidden_irreps.count(o3.Irrep(0, 1)), (0, 1))])
         self.node_embedding = LinearNodeEmbeddingBlock(
-            irreps_in=node_attr_irreps, irreps_out=node_feats_irreps
+            irreps_in=node_attr_irreps,
+            irreps_out=node_feats_irreps,
+            cueq_config=cueq_config,
         )
         self.radial_embedding = RadialEmbeddingBlock(
             r_max=r_max,
@@ -1529,6 +1533,8 @@ class AtomicXDMMACE(torch.nn.Module):
             hidden_irreps=hidden_irreps_out,
             avg_num_neighbors=avg_num_neighbors,
             radial_MLP=radial_MLP,
+            cueq_config=cueq_config,
+            oeq_config=oeq_config,
         )
         self.interactions = torch.nn.ModuleList([inter])
 
@@ -1543,6 +1549,8 @@ class AtomicXDMMACE(torch.nn.Module):
             correlation=correlation,
             num_elements=num_elements,
             use_sc=use_sc_first,
+            cueq_config=cueq_config,
+            oeq_config=oeq_config,
         )
         self.products = torch.nn.ModuleList([prod])
 
@@ -1559,7 +1567,11 @@ class AtomicXDMMACE(torch.nn.Module):
                 hidden_irreps_out, readout_irreps, num_elements=num_elements
             )
         else:
-            self.readouts.append(LinearReadoutBlock(hidden_irreps_out, readout_irreps))
+            self.readouts.append(
+                LinearReadoutBlock(
+                    hidden_irreps_out, readout_irreps, cueq_config, oeq_config
+                )
+            )
 
         for i in range(num_interactions - 1):
             if i == num_interactions - 2:
@@ -1575,6 +1587,8 @@ class AtomicXDMMACE(torch.nn.Module):
                 hidden_irreps=hidden_irreps_out,
                 avg_num_neighbors=avg_num_neighbors,
                 radial_MLP=radial_MLP,
+                cueq_config=cueq_config,
+                oeq_config=oeq_config,
             )
             self.interactions.append(inter)
             prod = EquivariantProductBasisBlock(
@@ -1583,6 +1597,8 @@ class AtomicXDMMACE(torch.nn.Module):
                 correlation=correlation,
                 num_elements=num_elements,
                 use_sc=True,
+                cueq_config=cueq_config,
+                oeq_config=oeq_config,
             )
             self.products.append(prod)
             if i == num_interactions - 2:
@@ -1594,7 +1610,11 @@ class AtomicXDMMACE(torch.nn.Module):
                     num_elements=num_elements,
                 )
             else:
-                self.readouts.append(LinearReadoutBlock(hidden_irreps, readout_irreps))
+                self.readouts.append(
+                    LinearReadoutBlock(
+                        hidden_irreps, readout_irreps, cueq_config, oeq_config
+                    )
+                )
 
         self.xdm_reference = AtomicElementReferenceBlock(element_means, element_stds)
 

@@ -1,5 +1,6 @@
 import h5py
 import numpy as np
+import pytest
 import torch
 from e3nn import o3
 from scipy.spatial.transform import Rotation as R
@@ -17,6 +18,13 @@ from mace.data.xdm import (
 from mace.tools import AtomicNumberTable
 from mace.tools.torch_geometric.batch import Batch
 from mace.tools.torch_geometric.dataloader import DataLoader
+
+try:
+    import cuequivariance as cue  # pylint: disable=unused-import
+
+    CUET_AVAILABLE = True
+except ImportError:
+    CUET_AVAILABLE = False
 
 torch.set_default_dtype(torch.float64)
 
@@ -155,7 +163,7 @@ def test_xdm_hdf5_dataset_pools_conformers_across_files(tmp_path):
     assert len(train_ds) == 2
 
 
-def _build_model(z_table, num_xdm_targets=4):
+def _build_model(z_table, num_xdm_targets=4, cueq_config=None):
     n_elements = len(z_table)
     rng = np.random.RandomState(0)
     element_means = rng.rand(n_elements, num_xdm_targets) + 1.0
@@ -178,7 +186,40 @@ def _build_model(z_table, num_xdm_targets=4):
         element_means=element_means,
         element_stds=element_stds,
         num_xdm_targets=num_xdm_targets,
+        cueq_config=cueq_config,
     )
+
+
+@pytest.mark.skipif(not CUET_AVAILABLE, reason="cuequivariance not installed")
+def test_atomic_xdm_mace_accepts_cueq_config():
+    """AtomicXDMMACE must thread cueq_config through to its interaction/product
+    blocks (mirroring the base MACE model) -- without this, the large per-edge
+    tensor-product intermediate in the plain e3nn path can OOM on systems of a
+    few thousand atoms, since AtomicXDMMACE has no other way to avoid it."""
+    from mace.modules.wrapper_ops import CuEquivarianceConfig
+
+    z_table = AtomicNumberTable([1, 6, 8])
+    cueq_config = CuEquivarianceConfig(
+        enabled=True, layout="ir_mul", group="O3_e3nn", optimize_all=True
+    )
+    model = _build_model(z_table, cueq_config=cueq_config)
+
+    atomic_numbers = np.array([8, 1, 1])
+    positions = np.array([[0.0, -2.0, 0.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0]])
+    targets = np.zeros((3, 4))
+    graph = build_xdm_atomic_data(atomic_numbers, positions, targets, z_table, cutoff=3.0)
+    batch = Batch.from_data_list([graph])
+    data = batch.to_dict()
+    data["positions"].requires_grad_(True)
+
+    output = model(data)
+    xdm_atomic = output["xdm_atomic"]
+    assert xdm_atomic.shape == (3, 4)
+    assert torch.isfinite(xdm_atomic).all()
+
+    xdm_atomic.sum().backward()
+    assert torch.isfinite(data["positions"].grad).all()
+    assert (data["positions"].grad.abs() > 0).any()
 
 
 def test_atomic_xdm_mace_forward_shapes():
