@@ -235,6 +235,55 @@ def test_mace_xdm_dispersion_combined_forward_and_forces():
     assert torch.allclose(out["forces"], numeric_force, atol=1e-6)
 
 
+def test_xdm_dispersion_sparse_path_matches_dense_path():
+    """Above _DENSE_MAX_NODES, XDMDispersionEnergy switches from a dense
+    [n,n] distance matrix to a cell-list neighbor search (mace.data.neighborhood)
+    to avoid O(n_nodes^2) memory on large single-structure MD systems. The two
+    pair-finding strategies must agree on both energy and forces."""
+    z_table = default_mlxdm_2x_atomic_number_table()
+    ref = mlxdm_2x_polarizability_reference(z_table)
+    module = XDMDispersionEnergy(alpha_free=ref["alpha_free"], v_free=ref["v_free"], cutoff=14.0)
+
+    torch.manual_seed(0)
+    n_atoms = 50  # well above a lowered threshold, small enough to run fast
+    atomic_numbers = np.random.RandomState(0).choice(z_table.zs, size=n_atoms)
+    positions = torch.randn(n_atoms, 3, dtype=torch.float64) * 6.0
+    positions.requires_grad_(True)
+    node_attrs = _build_two_atom_graph(z_table, atomic_numbers, positions)
+    batch = torch.zeros(n_atoms, dtype=torch.long)
+    xdm_atomic = torch.rand(n_atoms, 4, dtype=torch.float64) * 5 + 1.0
+
+    idx_i_dense, idx_j_dense, r_dense = module._dense_pairs(positions, batch)
+    idx_i_sparse, idx_j_sparse, r_sparse = module._sparse_pairs(positions, batch, num_graphs=1)
+
+    def sort_pairs(idx_i, idx_j, r):
+        key = idx_i * (n_atoms + 1) + idx_j
+        order = torch.argsort(key)
+        return idx_i[order], idx_j[order], r[order]
+
+    di, dj, dr = sort_pairs(idx_i_dense, idx_j_dense, r_dense)
+    si, sj, sr = sort_pairs(idx_i_sparse, idx_j_sparse, r_sparse)
+    assert torch.equal(di, si)
+    assert torch.equal(dj, sj)
+    assert torch.allclose(dr, sr, atol=1e-10)
+
+    e_dense = module(positions=positions, node_attrs=node_attrs, batch=batch, num_graphs=1, xdm_atomic=xdm_atomic)
+    e_dense.backward()
+    f_dense = -positions.grad.clone()
+    positions.grad = None
+
+    module._DENSE_MAX_NODES = 1  # force the forward() dispatch onto the sparse path
+    try:
+        e_sparse = module(positions=positions, node_attrs=node_attrs, batch=batch, num_graphs=1, xdm_atomic=xdm_atomic)
+        e_sparse.backward()
+        f_sparse = -positions.grad.clone()
+    finally:
+        module._DENSE_MAX_NODES = XDMDispersionEnergy._DENSE_MAX_NODES
+
+    assert torch.allclose(e_dense, e_sparse, rtol=1e-10)
+    assert torch.allclose(f_dense, f_sparse, atol=1e-8)
+
+
 def test_mace_xdm_dispersion_unsupported_element_raises():
     xdm_z_table = default_mlxdm_2x_atomic_number_table()
     xdm_model = _build_xdm_model(xdm_z_table)
