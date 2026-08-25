@@ -263,6 +263,33 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Resume from checkpoints_dir/<name>_latest.pt if it exists.",
     )
+    parser.add_argument(
+        "--foundation_model",
+        default=None,
+        help="Path to a plain (non-XDM) MACE .model file (e.g. from "
+        "mace_run_train) to warm-start the shared backbone from. Only the "
+        "node embedding, radial embedding, interaction, and product-basis "
+        "weights are transplanted -- shape-compatible only when this run's "
+        "--r_max/--num_bessel/--num_polynomial_cutoff/--max_ell/"
+        "--num_interactions/--hidden_irreps/--MLP_irreps/--correlation/"
+        "--interaction/--interaction_first match the foundation model's. "
+        "The foundation model must also have been trained with "
+        "--use_reduced_cg false (mace_run_train's own default) -- "
+        "AtomicXDMMACE has no --use_reduced_cg flag and always builds as "
+        "if it were false, while plain MACE/ScaleShiftMACE defaults to "
+        "true at the class level, and a mismatch there desyncs the "
+        "product-basis (symmetric contraction) tensor shapes, which are "
+        "then skipped rather than transplanted -- silently keeping most "
+        "of the network at its random init. Check the 'transplanted N "
+        "backbone tensors' log line: for a --num_interactions=2 model "
+        "that number should be in the 70s; anything close to 0 means the "
+        "transplant silently failed. "
+        "The XDM-specific readout heads (which predict num_xdm_targets "
+        "scalars, not one energy scalar) have no equivalent in the "
+        "foundation model and are always randomly initialized. Ignored if "
+        "--restart_latest finds an existing XDM checkpoint, since that "
+        "already has trained XDM weights to resume from.",
+    )
     parser.add_argument("--eval_interval", type=int, default=1)
     return parser
 
@@ -383,6 +410,94 @@ def evaluate(
         metrics[f"mae_{i}"] = compute_mae(errs)
         metrics[f"rmse_{i}"] = compute_rmse(errs)
     return metrics
+
+
+# Submodule names AtomicXDMMACE shares with plain MACE/ScaleShiftMACE: the
+# geometry/message-passing backbone. Everything else -- the per-layer
+# readouts and final_readout (num_xdm_targets scalars vs. one energy
+# scalar), atomic_energies_fn/scale_shift/pair_repulsion (energy-model-only,
+# AtomicXDMMACE has none of these), xdm_reference (XDM-only, the foundation
+# model has no equivalent) -- has no shape-compatible counterpart across the
+# two architectures and is deliberately left out so it stays randomly
+# initialized rather than silently loading a shape-mismatched tensor.
+_XDM_TRANSPLANTABLE_PREFIXES = (
+    "node_embedding.",
+    "radial_embedding.",
+    "interactions.",
+    "products.",
+)
+
+
+def warm_start_from_foundation_model(
+    model: AtomicXDMMACE, foundation_model_path: str, device: torch.device
+) -> None:
+    """Copy the shared message-passing backbone from a plain-MACE .model
+    file into a freshly built AtomicXDMMACE, in place.
+
+    Only tensors whose name and shape both match are copied; everything
+    else (most importantly the XDM readout heads, which have no
+    counterpart in a plain energy model) is left at its random init. This
+    is a plain state_dict transplant, not a full model load: it does not
+    check that the foundation model's architecture hyperparameters
+    (r_max, hidden_irreps, etc.) actually match this run's -- if they
+    don't, the relevant tensors simply won't be shape-compatible and will
+    be skipped, which is reported below so a hyperparameter mismatch is
+    visible immediately rather than training silently from scratch.
+    """
+    logging.info(f"Warm-starting backbone from foundation model: {foundation_model_path}")
+    foundation_model = torch.load(
+        foundation_model_path, map_location=device, weights_only=False
+    )
+    foundation_state = foundation_model.state_dict()
+    target_state = model.state_dict()
+
+    transplanted, skipped_shape, skipped_missing = [], [], []
+    to_load = {}
+    for name, tensor in foundation_state.items():
+        if not name.startswith(_XDM_TRANSPLANTABLE_PREFIXES):
+            continue
+        if name not in target_state:
+            skipped_missing.append(name)
+            continue
+        if target_state[name].shape != tensor.shape:
+            skipped_shape.append(
+                f"{name} (foundation {tuple(tensor.shape)} vs XDM model "
+                f"{tuple(target_state[name].shape)})"
+            )
+            continue
+        to_load[name] = tensor
+        transplanted.append(name)
+
+    model.load_state_dict(to_load, strict=False)
+
+    logging.info(
+        f"Warm start: transplanted {len(transplanted)} backbone tensors "
+        f"from the foundation model."
+    )
+    if skipped_shape:
+        logging.warning(
+            "Warm start: skipped %d backbone tensors due to a shape mismatch "
+            "-- check that this run's architecture flags match the "
+            "foundation model's:\n%s",
+            len(skipped_shape),
+            "\n".join(skipped_shape),
+        )
+    if skipped_missing:
+        logging.warning(
+            "Warm start: %d foundation-model backbone tensors have no "
+            "matching name in AtomicXDMMACE (architecture mismatch?): %s",
+            len(skipped_missing),
+            skipped_missing,
+        )
+    xdm_only = [
+        name
+        for name in target_state
+        if not name.startswith(_XDM_TRANSPLANTABLE_PREFIXES)
+    ]
+    logging.info(
+        f"Warm start: {len(xdm_only)} XDM-specific tensors (readouts, "
+        f"xdm_reference) remain randomly initialized."
+    )
 
 
 def main():
@@ -541,6 +656,9 @@ def main():
 
     latest_path = Path(args.checkpoints_dir) / f"{args.name}_latest.pt"
     best_path = Path(args.checkpoints_dir) / f"{args.name}_best.pt"
+
+    if args.foundation_model and not latest_path.exists():
+        warm_start_from_foundation_model(model, args.foundation_model, device)
 
     if args.restart_latest and latest_path.exists():
         checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
