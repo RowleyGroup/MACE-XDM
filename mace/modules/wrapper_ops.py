@@ -131,12 +131,29 @@ def with_scatter_sum(conv_tp: torch.nn.Module) -> torch.nn.Module:
     return conv_tp
 
 
-def with_cueq_conv_fusion(conv_tp: torch.nn.Module) -> torch.nn.Module:
-    """Wraps a cuet.ConvTensorProduct to use conv fusion"""
+def with_cueq_conv_fusion(conv_tp: torch.nn.Module, polynomial) -> torch.nn.Module:
+    """Wraps a cuet.SegmentedPolynomial to use conv fusion"""
+    # cuet.SegmentedPolynomial silently downgrades to SegmentedPolynomialNaive
+    # when cuequivariance_ops_torch cannot be imported: it warns and sets
+    # .method to "naive" even though uniform_1d was requested. The naive path
+    # has no fused conv (and no buffer_num_segments/operand_extent), so refuse
+    # here instead of letting it surface later as a missing-attribute crash.
+    method = getattr(conv_tp, "method", None)
+    if method != "uniform_1d":
+        raise RuntimeError(
+            "cuEquivariance conv fusion needs the uniform_1d kernels, but "
+            f"cuequivariance selected method={method!r} "
+            f"({type(getattr(conv_tp, 'm', None)).__name__}). That means "
+            "cuequivariance_ops_torch could not be imported. Check that the "
+            "installed cueq-cuda-* extra matches torch.version.cuda."
+        )
+
     conv_tp.original_forward = conv_tp.forward
-    num_segment = conv_tp.m.buffer_num_segments[0]
-    num_operands = conv_tp.m.operand_extent
-    conv_tp.weight_numel = num_segment * num_operands
+    # operands[0] is the weight operand; its size is num_segments * extent,
+    # the same product the fused implementation exposes through
+    # buffer_num_segments/operand_extent. Reading it from the descriptor keeps
+    # this independent of which backend cuequivariance selected.
+    conv_tp.weight_numel = polynomial.operands[0].size
 
     def forward(
         self,
@@ -250,19 +267,23 @@ class TensorProduct:
             and (cueq_config.optimize_all or cueq_config.optimize_channelwise)
         ):
             if cueq_config.conv_fusion and use_conv_fusion:
+                polynomial = (
+                    cue.descriptors.channelwise_tensor_product(
+                        cue.Irreps(cueq_config.group, irreps_in1),
+                        cue.Irreps(cueq_config.group, irreps_in2),
+                        cue.Irreps(cueq_config.group, irreps_out),
+                    )
+                    .flatten_coefficient_modes()
+                    .squeeze_modes()
+                    .polynomial
+                )
                 return with_cueq_conv_fusion(
                     cuet.SegmentedPolynomial(
-                        cue.descriptors.channelwise_tensor_product(
-                            cue.Irreps(cueq_config.group, irreps_in1),
-                            cue.Irreps(cueq_config.group, irreps_in2),
-                            cue.Irreps(cueq_config.group, irreps_out),
-                        )
-                        .flatten_coefficient_modes()
-                        .squeeze_modes()
-                        .polynomial,
+                        polynomial,
                         math_dtype=torch.get_default_dtype(),
                         method="uniform_1d",
-                    )
+                    ),
+                    polynomial,
                 )
             return cuet.ChannelWiseTensorProduct(
                 cue.Irreps(cueq_config.group, irreps_in1),
