@@ -146,9 +146,14 @@ class CueqConvFusionWrapper(torch.nn.Module):
         super().__init__()
         self.conv_tp = conv_tp
 
-        num_segment = conv_tp.m.buffer_num_segments[0]
-        num_operands = conv_tp.m.operand_extent
-        self.weight_numel = num_segment * num_operands
+        # conv_tp.m is the backend implementation chosen by cuet.SegmentedPolynomial
+        # (e.g. "uniform_1d"/"fused_tp" when cuequivariance_ops_torch is available,
+        # or "naive" as a CPU/portability fallback). buffer_num_segments/operand_extent
+        # are only populated on the CUDA-optimized backends, so compute the weight
+        # count from the polynomial descriptor itself, which is always present
+        # regardless of which backend ended up being selected.
+        weights_operand = conv_tp._polynomial_orig.inputs[0]
+        self.weight_numel = weights_operand.size
 
     @property
     def m(self):
