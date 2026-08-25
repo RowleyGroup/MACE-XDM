@@ -115,6 +115,90 @@ class NonLinearReadoutBlock(torch.nn.Module):
         return self.linear_2(x)  # [n_nodes, len(heads)]
 
 
+def _assert_scalar_irreps(irreps: o3.Irreps, who: str) -> None:
+    if any(mul_ir.ir.l != 0 or mul_ir.ir.p != 1 for mul_ir in irreps):
+        raise ValueError(
+            f"{who} only supports invariant scalar (0e) irreps, got {irreps}. "
+            "Per-element weight selection via a one-hot is only a well-defined "
+            "equivariant operation for invariant scalars -- there's no "
+            "rotation-consistent way to pick a per-element weight for l>0 "
+            "features the way there is for a plain per-element scalar affine map."
+        )
+
+
+@compile_mode("script")
+class PerElementLinearReadoutBlock(torch.nn.Module):
+    """Linear readout with its own dedicated weight matrix and bias per
+    element, instead of one linear map shared across every element.
+
+    Motivation: a shared readout is fit as a flat average over every atom
+    regardless of element, so a rare element (a small fraction of atoms) has
+    little influence on it relative to abundant ones -- its prediction quality
+    can be limited by, or even regress toward, whatever compromise best suits
+    the abundant elements. Giving every element its own readout weights
+    removes that competition for the last layer's capacity, the same way
+    ANI-style per-element networks never share weights across elements at
+    all, while still sharing the equivariant backbone that produces the
+    scalar features this operates on.
+    """
+
+    def __init__(self, irreps_in: o3.Irreps, irrep_out: o3.Irreps, num_elements: int):
+        super().__init__()
+        irreps_in = o3.Irreps(irreps_in)
+        irrep_out = o3.Irreps(irrep_out)
+        _assert_scalar_irreps(irreps_in, "PerElementLinearReadoutBlock irreps_in")
+        _assert_scalar_irreps(irrep_out, "PerElementLinearReadoutBlock irrep_out")
+        self.in_dim = irreps_in.dim
+        self.out_dim = irrep_out.dim
+        self.num_elements = num_elements
+        self.weight = torch.nn.Parameter(
+            torch.randn(num_elements, self.in_dim, self.out_dim) / (self.in_dim**0.5)
+        )
+        self.bias = torch.nn.Parameter(torch.zeros(num_elements, self.out_dim))
+
+    def forward(
+        self,
+        x: torch.Tensor,  # [n_nodes, in_dim]
+        node_attrs: torch.Tensor,  # [n_nodes, num_elements], one-hot
+    ) -> torch.Tensor:  # [n_nodes, out_dim]
+        per_element_out = torch.einsum("ni,eio->neo", x, self.weight)
+        out = torch.einsum("neo,ne->no", per_element_out, node_attrs)
+        bias = torch.einsum("eo,ne->no", self.bias, node_attrs)
+        return out + bias
+
+
+@compile_mode("script")
+class PerElementNonLinearReadoutBlock(torch.nn.Module):
+    """Two-layer, per-element-weighted, gated readout -- the per-element
+    analogue of ``NonLinearReadoutBlock`` (see ``PerElementLinearReadoutBlock``
+    for the motivation). Operates entirely on invariant scalars, so the gate
+    is applied elementwise directly rather than via e3nn's irreps-aware
+    ``Activation`` wrapper (which exists to handle gating mixed-irreps
+    features, not needed here).
+    """
+
+    def __init__(
+        self,
+        irreps_in: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        gate: Callable,
+        irrep_out: o3.Irreps,
+        num_elements: int,
+    ):
+        super().__init__()
+        self.linear_1 = PerElementLinearReadoutBlock(irreps_in, MLP_irreps, num_elements)
+        self.gate = gate
+        self.linear_2 = PerElementLinearReadoutBlock(MLP_irreps, irrep_out, num_elements)
+
+    def forward(
+        self,
+        x: torch.Tensor,  # [n_nodes, in_dim]
+        node_attrs: torch.Tensor,  # [n_nodes, num_elements], one-hot
+    ) -> torch.Tensor:  # [n_nodes, out_dim]
+        h = self.gate(self.linear_1(x, node_attrs))
+        return self.linear_2(h, node_attrs)
+
+
 @simplify_if_compile
 @compile_mode("script")
 class NonLinearBiasReadoutBlock(torch.nn.Module):
@@ -1395,3 +1479,59 @@ class ScaleShiftBlock(torch.nn.Module):
             else f"{self.shift.item():.4f}"
         )
         return f"{self.__class__.__name__}(scale={formatted_scale}, shift={formatted_shift})"
+
+
+@compile_mode("script")
+class AtomicElementReferenceBlock(torch.nn.Module):
+    """Per-element, per-property z-score reference.
+
+    Generalizes AtomicEnergiesBlock/ScaleShiftBlock from a single scalar (energy)
+    to several simultaneous per-atom target properties (e.g. XDM's M1, M2, M3,
+    Veff): each chemical element has its own mean and standardization width for
+    each property. The network predicts the standardized residual and this
+    block maps it back to physical units:
+        physical = mean[Z] + std[Z] * standardized
+    ``std`` need not be the literal empirical std of a specific dataset -- it's
+    just whatever per-element scale was used to standardize the training
+    targets (computed from the training set via ``--element_stats dataset``,
+    or a fixed width chosen for some other, possibly broader/multi-modal,
+    reference distribution, e.g. ``--element_stats mlxdm_2x``).
+    """
+
+    mean: torch.Tensor
+    std: torch.Tensor
+
+    def __init__(
+        self,
+        mean: Union[np.ndarray, torch.Tensor],
+        std: Union[np.ndarray, torch.Tensor],
+    ):
+        super().__init__()
+        mean_t = torch.as_tensor(mean, dtype=torch.get_default_dtype())
+        std_t = torch.as_tensor(std, dtype=torch.get_default_dtype())
+        assert mean_t.shape == std_t.shape
+        assert mean_t.dim() == 2  # [n_elements, n_properties]
+        self.register_buffer("mean", mean_t)
+        self.register_buffer("std", std_t)
+
+    def forward(
+        self, standardized: torch.Tensor, node_attrs: torch.Tensor
+    ) -> torch.Tensor:
+        # node_attrs: one-hot element indicator [n_nodes, n_elements]
+        mean = torch.matmul(node_attrs, self.mean.to(dtype=node_attrs.dtype))
+        std = torch.matmul(node_attrs, self.std.to(dtype=node_attrs.dtype))
+        return mean + std * standardized
+
+    def standardize(
+        self, physical: torch.Tensor, node_attrs: torch.Tensor
+    ) -> torch.Tensor:
+        mean = torch.matmul(node_attrs, self.mean.to(dtype=node_attrs.dtype))
+        std = torch.matmul(node_attrs, self.std.to(dtype=node_attrs.dtype))
+        return (physical - mean) / std
+
+    def __repr__(self):
+        n_elements, n_properties = self.mean.shape
+        return (
+            f"{self.__class__.__name__}(n_elements={n_elements}, "
+            f"n_properties={n_properties})"
+        )

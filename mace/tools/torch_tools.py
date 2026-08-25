@@ -84,6 +84,47 @@ def set_default_dtype(dtype: str) -> None:
     torch.set_default_dtype(dtype_dict[dtype])
 
 
+@contextmanager
+def safe_jit_load_map_location(map_location):
+    """Work around e3nn<=0.4.x: ``CodeGenMixin.__setstate__`` (used to
+    restore the compiled tensor-product/Linear code-gen submodules of any
+    e3nn-based model, e.g. MACE) calls ``torch.jit.load(buffer)`` internally
+    without forwarding the outer ``torch.load``'s ``map_location``. Without
+    this, unpickling a model that was even partly built/saved on a GPU
+    machine raises a "Found no NVIDIA driver" RuntimeError when loading it on
+    a CPU-only machine, even though ``torch.load(..., map_location="cpu")``
+    was used. This context manager temporarily patches ``torch.jit.load`` to
+    force the given ``map_location`` regardless of what (if anything) is
+    passed to it internally; harmless to apply even when loading something
+    that never calls ``torch.jit.load`` at all (e.g. a plain checkpoint dict).
+    """
+    forced_map_location = map_location
+    original_jit_load = torch.jit.load
+
+    def _patched_jit_load(f, map_location=None, _extra_files=None, _restore_shapes=False):  # noqa: ARG001
+        return original_jit_load(
+            f,
+            map_location=forced_map_location,
+            _extra_files=_extra_files or {},
+            _restore_shapes=_restore_shapes,
+        )
+
+    torch.jit.load = _patched_jit_load
+    try:
+        yield
+    finally:
+        torch.jit.load = original_jit_load
+
+
+def load_full_model(path: str, device="cpu") -> torch.nn.Module:
+    """Load a full ``torch.save(model, ...)``'d module (e.g. a MACE
+    ``<name>.model`` file), safe against the CPU-load issue above."""
+    with safe_jit_load_map_location(device):
+        model = torch.load(path, map_location=device, weights_only=False)
+    model.eval()
+    return model.to(device)
+
+
 def get_change_of_basis() -> torch.Tensor:
     return CartesianTensor("ij=ji").reduced_tensor_products().change_of_basis
 

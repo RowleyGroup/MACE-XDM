@@ -19,6 +19,24 @@ from .utils import (
     test_config_types,
     update_keyspec_from_kwargs,
 )
+from .xdm import (
+    XDMHDF5Dataset,
+    build_xdm_atomic_data,
+    compute_xdm_element_statistics,
+    discover_atomic_number_table,
+    discover_molecule_names,
+    find_leaf_groups,
+    species_to_atomic_numbers,
+)
+from .xdm_mlxdm2x_stats import (
+    MLXDM_2X_ATOMIC_NUMBERS,
+    MLXDM_2X_BJ_A1,
+    MLXDM_2X_BJ_A2,
+    MLXDM_2X_DISPERSION_CUTOFF,
+    default_mlxdm_2x_atomic_number_table,
+    mlxdm_2x_polarizability_reference,
+    mlxdm_2x_reference_stats,
+)
 
 __all__ = [
     "get_neighborhood",
@@ -41,4 +59,18 @@ __all__ = [
     "update_keyspec_from_kwargs",
     "LMDBDataset",
     "build_fake_padding_graph",
+    "XDMHDF5Dataset",
+    "build_xdm_atomic_data",
+    "compute_xdm_element_statistics",
+    "discover_atomic_number_table",
+    "discover_molecule_names",
+    "find_leaf_groups",
+    "species_to_atomic_numbers",
+    "MLXDM_2X_ATOMIC_NUMBERS",
+    "MLXDM_2X_BJ_A1",
+    "MLXDM_2X_BJ_A2",
+    "MLXDM_2X_DISPERSION_CUTOFF",
+    "default_mlxdm_2x_atomic_number_table",
+    "mlxdm_2x_polarizability_reference",
+    "mlxdm_2x_reference_stats",
 ]

@@ -17,6 +17,7 @@ from mace.tools.scatter import scatter_mean, scatter_sum
 from mace.tools.torch_tools import get_change_of_basis, spherical_to_cartesian
 
 from .blocks import (
+    AtomicElementReferenceBlock,
     AtomicEnergiesBlock,
     EquivariantProductBasisBlock,
     InteractionBlock,
@@ -27,6 +28,8 @@ from .blocks import (
     NonLinearDipolePolarReadoutBlock,
     NonLinearDipoleReadoutBlock,
     NonLinearReadoutBlock,
+    PerElementLinearReadoutBlock,
+    PerElementNonLinearReadoutBlock,
     RadialEmbeddingBlock,
     ScaleShiftBlock,
 )
@@ -1430,3 +1433,245 @@ class EnergyDipolesMACE(torch.nn.Module):
             "atomic_dipoles": atomic_dipoles,
         }
         return output
+
+
+@compile_mode("script")
+class AtomicXDMMACE(torch.nn.Module):
+    """MACE body with a readout for per-atom XDM dispersion coefficients.
+
+    Predicts, for every atom, the exchange-hole dipole moment (XDM) moments
+    M1, M2, M3 and effective volume Veff (or any fixed-size set of per-atom
+    scalar properties, see ``num_xdm_targets``). Structurally this mirrors
+    ``AtomicDipolesMACE``: the same interaction/product-basis body, but the
+    per-layer readouts emit ``num_xdm_targets`` invariant (0e) scalars per atom
+    instead of an l=1 dipole vector, and their per-layer contributions are
+    summed the same way atomic energies are summed in the base ``MACE`` model.
+
+    The raw summed readout is a per-element standardized (z-scored) residual;
+    ``xdm_reference`` (an ``AtomicElementReferenceBlock``) holds the per-element
+    mean/std of each target computed from the training set and maps the
+    residual back to physical units: ``physical = mean[Z] + std[Z] * residual``.
+    """
+
+    def __init__(
+        self,
+        r_max: float,
+        num_bessel: int,
+        num_polynomial_cutoff: int,
+        max_ell: int,
+        interaction_cls: Type[InteractionBlock],
+        interaction_cls_first: Type[InteractionBlock],
+        num_interactions: int,
+        num_elements: int,
+        hidden_irreps: o3.Irreps,
+        MLP_irreps: o3.Irreps,
+        avg_num_neighbors: float,
+        atomic_numbers: List[int],
+        correlation: int,
+        gate: Optional[Callable],
+        element_means: Union[np.ndarray, torch.Tensor],  # [n_elements, num_xdm_targets]
+        element_stds: Union[np.ndarray, torch.Tensor],  # [n_elements, num_xdm_targets]
+        num_xdm_targets: int = 4,
+        radial_type: Optional[str] = "bessel",
+        radial_MLP: Optional[List[int]] = None,
+        cueq_config: Optional[Dict[str, Any]] = None,
+        oeq_config: Optional[Dict[str, Any]] = None,
+    ):
+        super().__init__()
+        self.register_buffer(
+            "atomic_numbers", torch.tensor(atomic_numbers, dtype=torch.int64)
+        )
+        self.register_buffer("r_max", torch.tensor(r_max, dtype=torch.float64))
+        self.register_buffer(
+            "num_interactions", torch.tensor(num_interactions, dtype=torch.int64)
+        )
+        self.num_xdm_targets = num_xdm_targets
+
+        # Embedding
+        node_attr_irreps = o3.Irreps([(num_elements, (0, 1))])
+        node_feats_irreps = o3.Irreps([(hidden_irreps.count(o3.Irrep(0, 1)), (0, 1))])
+        self.node_embedding = LinearNodeEmbeddingBlock(
+            irreps_in=node_attr_irreps,
+            irreps_out=node_feats_irreps,
+            cueq_config=cueq_config,
+        )
+        self.radial_embedding = RadialEmbeddingBlock(
+            r_max=r_max,
+            num_bessel=num_bessel,
+            num_polynomial_cutoff=num_polynomial_cutoff,
+            radial_type=radial_type,
+        )
+        edge_feats_irreps = o3.Irreps(f"{self.radial_embedding.out_dim}x0e")
+
+        sh_irreps = o3.Irreps.spherical_harmonics(max_ell)
+        num_features = hidden_irreps.count(o3.Irrep(0, 1))
+        interaction_irreps = (sh_irreps * num_features).sort()[0].simplify()
+        self.spherical_harmonics = o3.SphericalHarmonics(
+            sh_irreps, normalize=True, normalization="component"
+        )
+        if radial_MLP is None:
+            radial_MLP = [64, 64, 64]
+
+        readout_irreps = o3.Irreps(f"{num_xdm_targets}x0e")
+
+        # Interactions and readouts. Since the target (M1, M2, M3, Veff) is
+        # purely invariant scalars -- like energy, unlike a dipole -- the last
+        # layer's channels are reduced to scalars-only before the final
+        # readout, mirroring the base MACE energy model exactly (an l>0
+        # feature cannot contribute to a linear scalar readout by symmetry
+        # anyway, so carrying it through the last, most expensive
+        # correlation-order tensor product is wasted compute).
+        if num_interactions == 1:
+            hidden_irreps_out = str(hidden_irreps[0])
+        else:
+            hidden_irreps_out = hidden_irreps
+        inter = interaction_cls_first(
+            node_attrs_irreps=node_attr_irreps,
+            node_feats_irreps=node_feats_irreps,
+            edge_attrs_irreps=sh_irreps,
+            edge_feats_irreps=edge_feats_irreps,
+            target_irreps=interaction_irreps,
+            hidden_irreps=hidden_irreps_out,
+            avg_num_neighbors=avg_num_neighbors,
+            radial_MLP=radial_MLP,
+            cueq_config=cueq_config,
+            oeq_config=oeq_config,
+        )
+        self.interactions = torch.nn.ModuleList([inter])
+
+        use_sc_first = False
+        if "Residual" in str(interaction_cls_first):
+            use_sc_first = True
+
+        node_feats_irreps_out = inter.target_irreps
+        prod = EquivariantProductBasisBlock(
+            node_feats_irreps=node_feats_irreps_out,
+            target_irreps=hidden_irreps_out,
+            correlation=correlation,
+            num_elements=num_elements,
+            use_sc=use_sc_first,
+            cueq_config=cueq_config,
+            oeq_config=oeq_config,
+        )
+        self.products = torch.nn.ModuleList([prod])
+
+        # self.readouts holds every non-final layer's (shared) readout;
+        # self.final_readout is the last layer's readout only, kept separate
+        # because -- unlike every other readout here -- it's per-element (see
+        # PerElementLinearReadoutBlock): the last layer's channels are always
+        # scalars-only (see above), so the final readout is where a rare
+        # element's fit is otherwise most exposed to being outweighed by
+        # abundant elements in a single shared set of weights.
+        self.readouts = torch.nn.ModuleList()
+        if num_interactions == 1:
+            self.final_readout: torch.nn.Module = PerElementLinearReadoutBlock(
+                hidden_irreps_out, readout_irreps, num_elements=num_elements
+            )
+        else:
+            self.readouts.append(
+                LinearReadoutBlock(
+                    hidden_irreps_out, readout_irreps, cueq_config, oeq_config
+                )
+            )
+
+        for i in range(num_interactions - 1):
+            if i == num_interactions - 2:
+                hidden_irreps_out = str(hidden_irreps[0])  # scalars only for last layer
+            else:
+                hidden_irreps_out = hidden_irreps
+            inter = interaction_cls(
+                node_attrs_irreps=node_attr_irreps,
+                node_feats_irreps=hidden_irreps,
+                edge_attrs_irreps=sh_irreps,
+                edge_feats_irreps=edge_feats_irreps,
+                target_irreps=interaction_irreps,
+                hidden_irreps=hidden_irreps_out,
+                avg_num_neighbors=avg_num_neighbors,
+                radial_MLP=radial_MLP,
+                cueq_config=cueq_config,
+                oeq_config=oeq_config,
+            )
+            self.interactions.append(inter)
+            prod = EquivariantProductBasisBlock(
+                node_feats_irreps=interaction_irreps,
+                target_irreps=hidden_irreps_out,
+                correlation=correlation,
+                num_elements=num_elements,
+                use_sc=True,
+                cueq_config=cueq_config,
+                oeq_config=oeq_config,
+            )
+            self.products.append(prod)
+            if i == num_interactions - 2:
+                self.final_readout = PerElementNonLinearReadoutBlock(
+                    hidden_irreps_out,
+                    MLP_irreps,
+                    gate,
+                    irrep_out=readout_irreps,
+                    num_elements=num_elements,
+                )
+            else:
+                self.readouts.append(
+                    LinearReadoutBlock(
+                        hidden_irreps, readout_irreps, cueq_config, oeq_config
+                    )
+                )
+
+        self.xdm_reference = AtomicElementReferenceBlock(element_means, element_stds)
+
+    def forward(
+        self,
+        data: Dict[str, torch.Tensor],
+        training: bool = False,  # pylint: disable=W0613
+    ) -> Dict[str, Optional[torch.Tensor]]:
+        # Embeddings
+        node_feats = self.node_embedding(data["node_attrs"])
+        vectors, lengths = get_edge_vectors_and_lengths(
+            positions=data["positions"],
+            edge_index=data["edge_index"],
+            shifts=data["shifts"],
+        )
+        edge_attrs = self.spherical_harmonics(vectors)
+        edge_feats, cutoff = self.radial_embedding(
+            lengths, data["node_attrs"], data["edge_index"], self.atomic_numbers
+        )
+
+        # Interactions. self.readouts covers every layer except the last (see
+        # __init__); the last layer's readout is self.final_readout, applied
+        # separately below since -- unlike the others -- it's per-element and
+        # needs node_attrs.
+        contributions = []
+        num_layers = len(self.interactions)
+        for idx in range(num_layers):
+            interaction = self.interactions[idx]
+            product = self.products[idx]
+            node_feats, sc = interaction(
+                node_attrs=data["node_attrs"],
+                node_feats=node_feats,
+                edge_attrs=edge_attrs,
+                edge_feats=edge_feats,
+                edge_index=data["edge_index"],
+                cutoff=cutoff,
+            )
+            node_feats = product(
+                node_feats=node_feats,
+                sc=sc,
+                node_attrs=data["node_attrs"],
+            )
+            if idx == num_layers - 1:
+                contribution = self.final_readout(node_feats, data["node_attrs"])
+            else:
+                contribution = self.readouts[idx](node_feats)
+            contributions.append(
+                contribution.view(-1, self.num_xdm_targets)
+            )  # [n_nodes, num_xdm_targets]
+
+        xdm_standardized = torch.sum(
+            torch.stack(contributions, dim=-1), dim=-1
+        )  # [n_nodes, num_xdm_targets]
+        xdm_atomic = self.xdm_reference(xdm_standardized, data["node_attrs"])
+
+        return {
+            "xdm_standardized": xdm_standardized,
+            "xdm_atomic": xdm_atomic,
+        }

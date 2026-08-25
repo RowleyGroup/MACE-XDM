@@ -1,7 +1,9 @@
 ###########################################################################################
-# GPU-resident geometry minimization and velocity-Verlet MD for MACE models.
+# GPU-resident geometry minimization and velocity-Verlet/Langevin MD for MACE
+# models -- including the MACEXDMDispersion combined potential (short-range
+# MACE-PBE0 energy + MACE-XDM dispersion correction).
 #
-# Runs directly against a loaded MACE `torch.nn.Module` -- no ASE `Atoms`,
+# Runs directly against a loaded `torch.nn.Module` -- no ASE `Atoms`,
 # `Calculator` or `Dynamics` classes are used anywhere in this file. Atomic
 # positions, velocities, forces and the neighbor list all live as `torch`
 # tensors on the target device (CPU or CUDA) for the whole trajectory; the
@@ -9,15 +11,23 @@
 # (which needs numpy for `matscipy`, the same backend MACE's own ASE
 # calculator uses under the hood) and the occasional logging line.
 #
+# This is a straight port of the same-named script in ACEsuit/mace's
+# `scripts/gpu_md.py`, extended so `System` also accepts a `MACEXDMDispersion`
+# module (see `mace.modules.xdm_combined`) in place of a plain MACE model --
+# the only two differences that requires are (1) `node_attrs` must be built
+# from the XDM sub-model's element table, since `MACEXDMDispersion.forward`
+# re-derives the short-range model's own one-hot encoding internally, and (2)
+# its `forward` takes no `compute_stress` argument (XDM's dispersion sum is a
+# dense non-periodic pairwise calculation -- finite molecules only).
+#
 # Usage:
-#   python scripts/gpu_md.py --model model_swa.model --device cuda
-#   python scripts/gpu_md.py --model model_swa.model --xyz start.xyz --device cuda
+#   python scripts/gpu_md.py --model mace-pbe0_0_s2.model --device cuda
+#   python scripts/gpu_md.py --model mace-pbe0_0_s2.model --xdm-model xdm_element.model --xyz start.xyz --device cuda
 ###########################################################################################
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import re
 from typing import Callable, List, Optional, Sequence, Tuple
 
@@ -125,13 +135,25 @@ def demo_structure() -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
 
 
 # ---------------------------------------------------------------------------
-# GPU-resident atomic system wrapping a MACE model.
+# GPU-resident atomic system wrapping a MACE model (or a MACEXDMDispersion
+# combined potential).
 # ---------------------------------------------------------------------------
 class System:
     """Holds state (positions, cell, neighbor list) for one structure and
     evaluates energy/forces with a MACE model, staying on `device` between
     calls. The neighbor list is rebuilt with a Verlet skin so it doesn't need
-    to be recomputed every step."""
+    to be recomputed every step.
+
+    `model` may be either a plain MACE energy model, or a
+    `mace.modules.MACEXDMDispersion` combined potential (short-range MACE +
+    XDM dispersion). The latter is detected by duck-typing on `xdm_model`;
+    when present, `node_attrs`/`r_max` are taken from that sub-model's own
+    element table (`MACEXDMDispersion.forward` re-derives the short-range
+    model's one-hot encoding internally, and expects the top-level
+    `node_attrs` to be keyed to the XDM sub-model's table), and
+    `compute_stress` is unsupported (XDM's dispersion sum is a dense,
+    non-periodic pairwise calculation -- finite molecules only).
+    """
 
     def __init__(
         self,
@@ -146,11 +168,13 @@ class System:
         self.model = model.to(device).eval()
         self.device = torch.device(device)
         self.model_dtype = next(model.parameters()).dtype
-        self.r_max = float(model.r_max.item())
+        self.is_combined = hasattr(model, "xdm_model")
+        z_source = self.model.xdm_model if self.is_combined else self.model
+        self.r_max = float(z_source.r_max.item())
         self.skin = skin
         self.pbc = tuple(bool(p) for p in pbc)
 
-        z_table = AtomicNumberTable(model.atomic_numbers.tolist())
+        z_table = AtomicNumberTable(z_source.atomic_numbers.tolist())
         indices = atomic_numbers_to_indices(atomic_numbers, z_table=z_table)
         node_indices = torch.tensor(indices, dtype=torch.long, device=self.device).unsqueeze(-1)
         self.node_attrs = to_one_hot(node_indices, num_classes=len(z_table)).to(
@@ -230,15 +254,24 @@ class System:
             "ptr": self.ptr,
             "head": self.head,
         }
-        out = self.model(
-            data,
-            training=False,
-            compute_force=True,
-            compute_stress=compute_stress,
-        )
+        if self.is_combined:
+            if compute_stress:
+                raise ValueError(
+                    "MACEXDMDispersion combined potential does not support "
+                    "stress (finite molecules only)."
+                )
+            out = self.model(data, training=False, compute_force=True)
+            stress = None
+        else:
+            out = self.model(
+                data,
+                training=False,
+                compute_force=True,
+                compute_stress=compute_stress,
+            )
+            stress = out["stress"].detach().to(torch.float64) if compute_stress and out["stress"] is not None else None
         energy = float(out["energy"].detach().item())
         forces = out["forces"].detach().to(torch.float64)
-        stress = out["stress"].detach().to(torch.float64) if compute_stress and out["stress"] is not None else None
         return energy, forces, stress
 
     def accelerations(self, forces: torch.Tensor) -> torch.Tensor:
@@ -431,11 +464,72 @@ def langevin(
 
 
 # ---------------------------------------------------------------------------
+# Model loading helpers, shared with scripts/gpu_md_benchmark.py.
+# ---------------------------------------------------------------------------
+def load_pbe0_model(path: str, device: str) -> torch.nn.Module:
+    from mace.tools import load_full_model
+
+    model = load_full_model(path, device=device)
+    model.eval()
+    return model
+
+
+def load_combined_model(
+    pbe0_path: str,
+    xdm_path: str,
+    device: str,
+    dispersion_cutoff: float = 14.0,
+    a1: float = 0.4186,
+    a2: float = 2.6791,
+) -> torch.nn.Module:
+    """Build a MACEXDMDispersion combined potential (macepbe0 + macexdm) from
+    a short-range MACE-PBE0 model and a trained AtomicXDMMACE model, matching
+    `MACEXDMDispersionCalculator`'s own construction (see
+    `mace/calculators/xdm_dispersion.py`)."""
+    from mace.calculators.mace import get_model_dtype
+    from mace.data import mlxdm_2x_polarizability_reference
+    from mace.modules import MACEXDMDispersion, XDMDispersionEnergy, load_xdm_model
+    from mace.tools import AtomicNumberTable, load_full_model
+
+    short_range_model = load_full_model(pbe0_path, device=device)
+    xdm_model = load_xdm_model(xdm_path, device=device)
+
+    default_dtype = get_model_dtype(short_range_model)
+    if get_model_dtype(xdm_model) != default_dtype:
+        xdm_model = xdm_model.double() if default_dtype == "float64" else xdm_model.float()
+
+    xdm_z_table = AtomicNumberTable(xdm_model.atomic_numbers.tolist())
+    ref = mlxdm_2x_polarizability_reference(xdm_z_table)
+    dispersion_energy = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"],
+        v_free=ref["v_free"],
+        cutoff=dispersion_cutoff,
+        a1=a1,
+        a2=a2,
+    )
+
+    model = MACEXDMDispersion(
+        short_range_model=short_range_model,
+        xdm_model=xdm_model,
+        dispersion_energy=dispersion_energy,
+    ).to(device)
+    model.eval()
+    return model
+
+
+# ---------------------------------------------------------------------------
 # CLI demo
 # ---------------------------------------------------------------------------
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--model", required=True, help="Path to a MACE model file")
+    parser.add_argument("--model", required=True, help="Path to a MACE-PBE0 model file")
+    parser.add_argument(
+        "--xdm-model",
+        default=None,
+        help="Optional path to a trained AtomicXDMMACE model/checkpoint; if given, "
+        "runs the demo against the combined macepbe0+macexdm potential instead of "
+        "the bare --model.",
+    )
     parser.add_argument("--xyz", default=None, help="Optional (extended) XYZ file to load")
     parser.add_argument("--device", default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--fmax", type=float, default=0.03, help="Force convergence, eV/Angstrom")
@@ -449,7 +543,16 @@ def main() -> None:
 
     torch.manual_seed(args.seed)
 
-    model = torch.load(args.model, map_location=args.device, weights_only=False)
+    if args.xdm_model is not None:
+        if args.xyz is None:
+            raise SystemExit(
+                "--xdm-model requires --xyz: the combined macepbe0+macexdm potential "
+                "only supports finite (non-periodic) molecules, not the default "
+                "periodic Cu demo structure."
+            )
+        model = load_combined_model(args.model, args.xdm_model, device=args.device)
+    else:
+        model = load_pbe0_model(args.model, device=args.device)
 
     if args.xyz is not None:
         atomic_numbers, positions, cell = read_xyz(args.xyz)

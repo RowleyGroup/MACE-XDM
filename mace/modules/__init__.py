@@ -3,6 +3,7 @@ from typing import Callable, Dict, Optional, Type
 import torch
 
 from .blocks import (
+    AtomicElementReferenceBlock,
     AtomicEnergiesBlock,
     EquivariantProductBasisBlock,
     GeneralNonLinearBiasReadoutBlock,
@@ -15,6 +16,8 @@ from .blocks import (
     NonLinearDipolePolarReadoutBlock,
     NonLinearDipoleReadoutBlock,
     NonLinearReadoutBlock,
+    PerElementLinearReadoutBlock,
+    PerElementNonLinearReadoutBlock,
     RadialEmbeddingBlock,
     RealAgnosticAttResidualInteractionBlock,
     RealAgnosticDensityInteractionBlock,
@@ -42,6 +45,7 @@ from .models import (
     MACE,
     AtomicDielectricMACE,
     AtomicDipolesMACE,
+    AtomicXDMMACE,
     EnergyDipolesMACE,
     ScaleShiftMACE,
 )
@@ -57,6 +61,8 @@ from .utils import (
     compute_rms_dipoles,
     compute_statistics,
 )
+from .xdm_combined import MACEXDMDispersion
+from .xdm_dispersion import XDMDispersionEnergy
 
 interaction_classes: Dict[str, Type[InteractionBlock]] = {
     "RealAgnosticResidualInteractionBlock": RealAgnosticResidualInteractionBlock,
@@ -89,8 +95,18 @@ gate_dict: Dict[str, Optional[Callable]] = {
     "None": None,
 }
 
+# Imported here (after gate_dict/interaction_classes above) rather than in the
+# main import block, since xdm_checkpoint needs those two names from this
+# same __init__ module -- importing it earlier would be a circular import.
+from .xdm_checkpoint import (  # noqa: E402
+    build_atomic_xdm_mace_from_args,
+    load_atomic_xdm_mace_checkpoint,
+    load_xdm_model,
+)
+
 __all__ = [
     "AtomicEnergiesBlock",
+    "AtomicElementReferenceBlock",
     "RadialEmbeddingBlock",
     "ZBLBasis",
     "LinearNodeEmbeddingBlock",
@@ -103,6 +119,8 @@ __all__ = [
     "NonLinearDipolePolarReadoutBlock",
     "InteractionBlock",
     "NonLinearReadoutBlock",
+    "PerElementLinearReadoutBlock",
+    "PerElementNonLinearReadoutBlock",
     "PolynomialCutoff",
     "BesselBasis",
     "GaussianBasis",
@@ -110,6 +128,12 @@ __all__ = [
     "ScaleShiftMACE",
     "AtomicDipolesMACE",
     "AtomicDielectricMACE",
+    "AtomicXDMMACE",
+    "XDMDispersionEnergy",
+    "MACEXDMDispersion",
+    "build_atomic_xdm_mace_from_args",
+    "load_atomic_xdm_mace_checkpoint",
+    "load_xdm_model",
     "EnergyDipolesMACE",
     "PolarMACE",
     "WeightedEnergyForcesLoss",
