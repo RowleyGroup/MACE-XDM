@@ -49,6 +49,32 @@ def find_leaf_groups(node: h5py.Group, path: str = "") -> List[str]:
     return leaves
 
 
+def _filter_leaf_groups_with_keys(
+    f: h5py.File, leaf_paths: List[str], required_keys: Sequence[str]
+) -> List[str]:
+    """Keep only leaf groups that have every dataset in ``required_keys``.
+
+    Mixed-provenance files commonly pool XDM-labeled molecules (M1/M2/M3/Veff
+    present) together with DFT-only data -- e.g. active-learning batches that
+    have energies/forces but no XDM labels yet -- under the same top-level
+    file. Without this filter, the first such leaf group encountered crashes
+    with a KeyError deep inside whichever function tries to read its
+    (nonexistent) XDM target dataset, rather than being skipped.
+    """
+    kept = [p for p in leaf_paths if all(k in f[p] for k in required_keys)]
+    n_skipped = len(leaf_paths) - len(kept)
+    if n_skipped:
+        logging.warning(
+            "Skipping %d/%d leaf groups missing %s (likely DFT-only data "
+            "mixed into this file, e.g. active-learning batches with no XDM "
+            "labels yet).",
+            n_skipped,
+            len(leaf_paths),
+            list(required_keys),
+        )
+    return kept
+
+
 def molecule_name(leaf_path: str) -> str:
     """The trailing path component of a leaf group, used as the molecule's
     identity for train/valid splitting and for merging conformers of the same
@@ -175,7 +201,10 @@ class XDMHDF5Dataset(torch.utils.data.Dataset):
         self.index: List[Tuple[int, str, int]] = []
         for file_idx, path in enumerate(self.file_paths):
             with h5py.File(path, "r") as f:
-                for leaf_path in find_leaf_groups(f):
+                leaf_paths = _filter_leaf_groups_with_keys(
+                    f, find_leaf_groups(f), self.target_keys
+                )
+                for leaf_path in leaf_paths:
                     if (
                         molecule_name_filter is not None
                         and molecule_name(leaf_path) not in molecule_name_filter
@@ -224,12 +253,20 @@ class XDMHDF5Dataset(torch.utils.data.Dataset):
 
 def discover_molecule_names(
     file_paths: FilePaths,
+    target_keys: Sequence[str] = DEFAULT_TARGET_KEYS,
 ) -> List[str]:
-    """Union of molecule (leaf-group) names across one or more HDF5 files."""
+    """Union of molecule (leaf-group) names across one or more HDF5 files,
+    restricted to leaf groups that actually carry every key in
+    ``target_keys`` (see ``_filter_leaf_groups_with_keys``) -- this is what
+    train/valid/test splitting draws from, so a molecule with no XDM labels
+    should never be assigned to a split in the first place."""
     names = set()
     for path in _as_file_list(file_paths):
         with h5py.File(path, "r") as f:
-            names.update(molecule_name(p) for p in find_leaf_groups(f))
+            leaf_paths = _filter_leaf_groups_with_keys(
+                f, find_leaf_groups(f), target_keys
+            )
+            names.update(molecule_name(p) for p in leaf_paths)
     return sorted(names)
 
 
@@ -280,7 +317,10 @@ def compute_xdm_element_statistics(
 
     for path in _as_file_list(file_paths):
         with h5py.File(path, "r") as f:
-            for leaf_path in find_leaf_groups(f):
+            leaf_paths = _filter_leaf_groups_with_keys(
+                f, find_leaf_groups(f), target_keys
+            )
+            for leaf_path in leaf_paths:
                 if (
                     molecule_name_filter is not None
                     and molecule_name(leaf_path) not in molecule_name_filter
