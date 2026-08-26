@@ -10,7 +10,7 @@ import logging
 import time
 from functools import partial
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
@@ -22,6 +22,7 @@ from mace.data import (
     discover_atomic_number_table,
     discover_molecule_names,
     mlxdm_2x_reference_stats,
+    split_molecule_names,
 )
 from mace.modules import (
     AtomicXDMMACE,
@@ -315,56 +316,6 @@ def resolve_z_table(args: argparse.Namespace, train_files: List[str]) -> AtomicN
     return discover_atomic_number_table(train_files, species_key=args.species_key)
 
 
-def split_molecule_names(
-    args: argparse.Namespace,
-    train_files: List[str],
-    valid_files: Optional[List[str]],
-    test_files: Optional[List[str]],
-    target_keys: Sequence[str],
-) -> Dict[str, List[str]]:
-    """Split molecule names into disjoint train/valid/test sets.
-
-    Explicit --valid_files/--test_files are used as-is (and removed from the
-    training pool); everything else is drawn by molecule identity from
-    --train_files, so a single merged file can be split into all three parts
-    at once via --valid_fraction/--test_fraction.
-
-    Only molecules that actually carry every key in target_keys are
-    considered (see XDMHDF5Dataset/discover_molecule_names) -- a file that
-    pools XDM-labeled molecules together with DFT-only data (e.g.
-    active-learning batches with no XDM labels yet) should never assign the
-    latter to a split.
-    """
-    all_names = discover_molecule_names(train_files, target_keys=target_keys)
-    remaining = set(all_names)
-
-    valid_names: Optional[List[str]] = None
-    if args.valid_files is not None:
-        valid_names = discover_molecule_names(valid_files, target_keys=target_keys)
-        remaining -= set(valid_names)
-
-    test_names: Optional[List[str]] = None
-    if args.test_files is not None:
-        test_names = discover_molecule_names(test_files, target_keys=target_keys)
-        remaining -= set(test_names)
-
-    rng = np.random.RandomState(args.seed)
-    shuffled = sorted(remaining)
-    rng.shuffle(shuffled)
-
-    if valid_names is None:
-        n_valid = max(1, int(round(len(all_names) * args.valid_fraction)))
-        valid_names = shuffled[:n_valid]
-        shuffled = shuffled[n_valid:]
-    if test_names is None:
-        n_test = max(1, int(round(len(all_names) * args.test_fraction)))
-        test_names = shuffled[:n_test]
-        shuffled = shuffled[n_test:]
-
-    train_names = shuffled
-    return {"train": train_names, "valid": valid_names, "test": test_names}
-
-
 def dataloader_worker_init_fn(_worker_id: int, default_dtype: str) -> None:
     # torch.set_default_dtype() is per-process global state set once in
     # main(); DataLoader worker subprocesses don't reliably inherit it (e.g.
@@ -537,7 +488,15 @@ def main():
     z_table = resolve_z_table(args, train_files)
     logging.info(f"Atomic number table: {z_table}")
 
-    names = split_molecule_names(args, train_files, valid_files, test_files, target_keys)
+    names = split_molecule_names(
+        train_files,
+        valid_files,
+        test_files,
+        target_keys,
+        valid_fraction=args.valid_fraction,
+        test_fraction=args.test_fraction,
+        seed=args.seed,
+    )
     logging.info(
         f"Training molecules: {len(names['train'])}, "
         f"validation molecules: {len(names['valid'])}, "

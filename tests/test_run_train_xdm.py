@@ -1,4 +1,3 @@
-import argparse
 from functools import partial
 
 import h5py
@@ -31,22 +30,19 @@ def _write_master_file(path, n_molecules=20, seed=0, prefix="mol"):
     return path
 
 
-def _namespace(**overrides):
-    defaults = dict(
-        valid_files=None,
-        test_files=None,
-        valid_fraction=0.2,
-        test_fraction=0.2,
-        seed=0,
-    )
-    defaults.update(overrides)
-    return argparse.Namespace(**defaults)
+DEFAULT_SPLIT_KWARGS = dict(
+    target_keys=("M1", "M2", "M3", "Veff"),
+    valid_fraction=0.2,
+    test_fraction=0.2,
+    seed=0,
+)
 
 
 def test_split_molecule_names_disjoint_and_covers_all(tmp_path):
     path = _write_master_file(tmp_path / "master.h5", n_molecules=20)
-    args = _namespace()
-    names = split_molecule_names(args, [str(path)], None, None)
+    names = split_molecule_names(
+        [str(path)], None, None, **{**DEFAULT_SPLIT_KWARGS}
+    )
 
     train, valid, test = set(names["train"]), set(names["valid"]), set(names["test"])
     assert not (train & valid)
@@ -59,25 +55,29 @@ def test_split_molecule_names_disjoint_and_covers_all(tmp_path):
 
 def test_split_molecule_names_deterministic_with_seed(tmp_path):
     path = _write_master_file(tmp_path / "master.h5", n_molecules=20)
-    args1 = _namespace(seed=42)
-    args2 = _namespace(seed=42)
-    names1 = split_molecule_names(args1, [str(path)], None, None)
-    names2 = split_molecule_names(args2, [str(path)], None, None)
+    kwargs = {**DEFAULT_SPLIT_KWARGS, "seed": 42}
+    names1 = split_molecule_names([str(path)], None, None, **kwargs)
+    names2 = split_molecule_names([str(path)], None, None, **kwargs)
     assert names1 == names2
 
 
 def test_split_molecule_names_different_seeds_differ(tmp_path):
     path = _write_master_file(tmp_path / "master.h5", n_molecules=20)
-    names1 = split_molecule_names(_namespace(seed=1), [str(path)], None, None)
-    names2 = split_molecule_names(_namespace(seed=2), [str(path)], None, None)
+    names1 = split_molecule_names(
+        [str(path)], None, None, **{**DEFAULT_SPLIT_KWARGS, "seed": 1}
+    )
+    names2 = split_molecule_names(
+        [str(path)], None, None, **{**DEFAULT_SPLIT_KWARGS, "seed": 2}
+    )
     assert names1 != names2
 
 
 def test_split_molecule_names_explicit_test_files_excluded_from_train(tmp_path):
     train_path = _write_master_file(tmp_path / "train.h5", n_molecules=10, prefix="trainmol")
     test_path = _write_master_file(tmp_path / "test.h5", n_molecules=5, prefix="testmol")
-    args = _namespace(test_files=[str(test_path)])
-    names = split_molecule_names(args, [str(train_path)], None, [str(test_path)])
+    names = split_molecule_names(
+        [str(train_path)], None, [str(test_path)], **{**DEFAULT_SPLIT_KWARGS}
+    )
 
     assert set(names["test"]) == {f"testmol_{i}" for i in range(5)}
     assert not (set(names["train"]) & set(names["test"]))
