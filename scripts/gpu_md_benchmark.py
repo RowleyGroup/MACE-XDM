@@ -122,7 +122,7 @@ def make_callback(system, symbols, csv_path, traj_path, start_time, ts_interval,
     return callback, close
 
 
-def run_benchmark(model, device, xyz_files, csv_filename, outdir, traj_interval, ts_interval):
+def run_benchmark(model, device, xyz_files, csv_filename, outdir, traj_interval, ts_interval, n_steps):
     os.makedirs(outdir, exist_ok=True)
 
     with open(csv_filename, mode="w", newline="") as f:
@@ -130,7 +130,7 @@ def run_benchmark(model, device, xyz_files, csv_filename, outdir, traj_interval,
         writer.writerow(["xyz_file", "n_atoms", "n_waters", "time_seconds"])
 
         print(f"Starting GPU-resident Langevin benchmark over {len(xyz_files)} "
-              f"water-ball structures, {MD_STEPS} steps each...")
+              f"water-ball structures, {n_steps} steps each...")
 
         for path in xyz_files:
             atomic_numbers, positions, cell = gpu_md.read_xyz(path)
@@ -165,7 +165,7 @@ def run_benchmark(model, device, xyz_files, csv_filename, outdir, traj_interval,
             gpu_md.langevin(
                 system,
                 dt_fs=TIMESTEP_FS,
-                n_steps=MD_STEPS,
+                n_steps=n_steps,
                 temperature_K=T,
                 friction=FRICTION,
                 seed=0,
@@ -177,7 +177,7 @@ def run_benchmark(model, device, xyz_files, csv_filename, outdir, traj_interval,
             elapsed_time = time_final - time_initial
 
             print(f"Completed {name} in {elapsed_time:.2f} seconds "
-                  f"({MD_STEPS / elapsed_time:.1f} steps/s).")
+                  f"({n_steps / elapsed_time:.1f} steps/s).")
 
             writer.writerow([name, n_atoms, n_waters, elapsed_time])
             f.flush()
@@ -203,6 +203,12 @@ def main():
                          help="Glob pattern for xyz files within --xyz-dir (default: %(default)s)")
     parser.add_argument("--limit", type=int, default=None,
                          help="Only benchmark the N smallest structures (default: all)")
+    parser.add_argument("--stride", type=int, default=1,
+                         help="After sorting by atom count, keep every Nth structure "
+                              "(default: 1, i.e. all). Applied before --limit. "
+                              "Ignored when --xyz-file is given.")
+    parser.add_argument("--n-steps", type=int, default=MD_STEPS,
+                         help="Number of MD steps to run per structure (default: %(default)s)")
     parser.add_argument("--xyz-file", default=None,
                          help="Benchmark only this single xyz file, instead of scanning --xyz-dir "
                               "(used to run one water-ball size per Slurm job)")
@@ -230,6 +236,8 @@ def main():
         default_csv = f"simulation_timings_{args.model}_gpu_{stem}.csv"
     else:
         xyz_files = find_xyz_files(args.xyz_dir, args.pattern)
+        if args.stride > 1:
+            xyz_files = xyz_files[::args.stride]
         if args.limit is not None:
             xyz_files = xyz_files[:args.limit]
         default_csv = f"simulation_timings_{args.model}_gpu.csv"
@@ -242,6 +250,7 @@ def main():
         args.outdir,
         args.traj_interval,
         args.ts_interval,
+        args.n_steps,
     )
 
 
