@@ -287,6 +287,15 @@ def evaluate(
 def main():
     args = build_parser().parse_args()
 
+    # DataLoader workers hand tensors back to the main process via mmap'd
+    # shared-memory files under the default "file_descriptor" strategy. On
+    # Alliance Canada compute nodes /dev/shm is small and not scaled to
+    # --mem-per-cpu, so a full pass with num_workers>0 (e.g. inside
+    # compute_mean_rms_energy_forces) can die with
+    # "unable to mmap ...: Cannot allocate memory". "file_system" instead
+    # uses named temp files and isn't subject to that cap.
+    torch.multiprocessing.set_sharing_strategy("file_system")
+
     Path(args.log_dir).mkdir(parents=True, exist_ok=True)
     Path(args.checkpoints_dir).mkdir(parents=True, exist_ok=True)
     Path(args.model_dir).mkdir(parents=True, exist_ok=True)
