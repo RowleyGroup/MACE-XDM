@@ -199,6 +199,27 @@ LIBCUE_OPS=$(find "$SITE_PACKAGES" -iname "libcue_ops*" | head -1)
 ldd "$LIBCUE_OPS" | grep "not found"   # must print nothing
 ```
 
+### 6b. `libcue_ops.so` itself may not be found via RPATH alone
+
+On nibi (same `cuequivariance-ops-cu13` version, 0.11.1, as Narval/Fir),
+`import cuequivariance_ops_torch` failed with
+`ImportError: libcue_ops.so: cannot open shared object file: No such file
+or directory` even after step 6's fix -- not one of *its* dependencies
+missing, `libcue_ops.so` itself. It had extracted correctly (118MB, at
+`<site-packages>/cuequivariance_ops/lib/libcue_ops.so`, matching the
+wheel's own listing exactly), but that directory isn't on the dynamic
+linker's default search path, and unlike Narval/Fir, the extension's own
+RPATH didn't cover it here. `scripts/install_cueq_ops.sh` now puts this
+directory on `LD_LIBRARY_PATH` itself (and persists it into the venv's
+activate script) rather than relying on RPATH, so this is handled
+automatically going forward -- documented here in case you're debugging
+an older venv that predates that fix, or diagnosing by hand:
+
+```bash
+find "$SITE_PACKAGES" -iname "libcue_ops*"     # confirm it actually extracted
+export LD_LIBRARY_PATH=$(dirname "$(find "$SITE_PACKAGES" -iname "libcue_ops*" | head -1)"):$LD_LIBRARY_PATH
+```
+
 ### 7. A few remaining plain-Python dependencies
 
 Once the compiled pieces resolve, `import cuequivariance_ops_torch` may

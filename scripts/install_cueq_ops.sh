@@ -17,6 +17,15 @@
 #     (pynvml, platformdirs, nvidia-cublas) that ARE fine to pip install
 #     normally through the wheelhouse.
 #
+#  3. libcue_ops.so (the actual compiled payload of cuequivariance-ops-cu13,
+#     ~118MB, extracted to <site-packages>/cuequivariance_ops/lib/) is not
+#     always found via the cuequivariance_ops_torch extension's own RPATH --
+#     confirmed working via RPATH alone on Narval/Fir, but not on nibi (same
+#     wheel, same version: 0.11.1). Rather than assume either way, this
+#     script puts that directory on LD_LIBRARY_PATH itself and persists it
+#     into the venv's own activate script, so it works regardless of
+#     whether RPATH alone would have been enough on a given cluster.
+#
 # Run this with the target venv already activated.
 #
 # Usage: scripts/install_cueq_ops.sh [version]
@@ -61,6 +70,30 @@ rm -rf "$TMPDIR"
 # Plain-Python deps cuequivariance_ops/cuequivariance_ops_torch need at
 # import time -- these install fine through the normal wheelhouse.
 pip install --quiet pynvml platformdirs nvidia-cublas
+
+# libcue_ops.so itself -- see point 3 in the header comment. Export for this
+# script's own self-check below, and persist into the venv's activate script
+# (separately from append_to_activate.sh's CUDA-module block, since this
+# path is venv-local and known now, right after extraction, rather than
+# cluster-specific) so future shells get it without rerunning this script.
+CUEQ_OPS_LIB="${SITE_PACKAGES}/cuequivariance_ops/lib"
+export LD_LIBRARY_PATH="${CUEQ_OPS_LIB}:${LD_LIBRARY_PATH:-}"
+
+VENV_ROOT=$(python -c "import sys; print(sys.prefix)")
+ACTIVATE="${VENV_ROOT}/bin/activate"
+MARKER="# >>> cuequivariance_ops lib path >>>"
+if [ -f "$ACTIVATE" ] && ! grep -qF "$MARKER" "$ACTIVATE"; then
+    cat >> "$ACTIVATE" <<BLOCK
+
+$MARKER
+# Added by scripts/install_cueq_ops.sh -- libcue_ops.so lives here and
+# isn't always on the dynamic linker's search path via RPATH alone (see
+# this script's header comment, point 3).
+export LD_LIBRARY_PATH=${CUEQ_OPS_LIB}:\${LD_LIBRARY_PATH:-}
+# <<< cuequivariance_ops lib path <<<
+BLOCK
+    echo "Appended cuequivariance_ops lib path to ${ACTIVATE}."
+fi
 
 python -c "import cuequivariance_ops_torch; print('cuequivariance_ops_torch OK:', cuequivariance_ops_torch.__file__)"
 
