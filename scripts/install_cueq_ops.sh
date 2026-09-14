@@ -71,6 +71,13 @@ rm -rf "$TMPDIR"
 # import time -- these install fine through the normal wheelhouse.
 pip install --quiet pynvml platformdirs nvidia-cublas
 
+# triton (for cuequivariance_ops_torch's fused_layer_norm_torch) is often
+# bundled automatically by a normal PyPI `pip install torch`, but Alliance
+# Canada's `--no-index torch` wheelhouse install doesn't pull it in, so
+# it needs to be requested explicitly here -- separate pip call from the
+# deps above so a wheelhouse/PyPI split between them can't fail atomically.
+pip install --quiet triton || pip install --quiet --index-url https://pypi.org/simple triton
+
 # libcue_ops.so itself -- see point 3 in the header comment. Export for this
 # script's own self-check below, and persist into the venv's activate script
 # (separately from append_to_activate.sh's CUDA-module block, since this
