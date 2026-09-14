@@ -41,6 +41,14 @@ cat >> "$ACTIVATE" <<BLOCK
 module load cuda/${CUDA_MODULE_VERSION} 2>/dev/null || true
 export PYTHONNOUSERSITE=1
 export LD_LIBRARY_PATH=${CUDACORE_LIB_PATH}:\${LD_LIBRARY_PATH:-}
+# e3nn 0.4.4's own o3/_wigner.py does a bare torch.load() of its bundled
+# constants.pt (no weights_only=False -- it predates that argument
+# existing), which crashes under PyTorch >=2.6's new default
+# (weights_only=True) on *any* `import e3nn`. This is PyTorch's own
+# documented escape hatch for legacy torch.load callers like this one --
+# not cueq/mace-specific, but this venv needs it or nothing that imports
+# e3nn will start.
+export TORCH_FORCE_NO_WEIGHTS_ONLY_LOAD=1
 # <<< cueq cuda setup <<<
 BLOCK
 
