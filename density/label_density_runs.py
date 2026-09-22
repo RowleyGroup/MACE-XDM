@@ -30,6 +30,12 @@ MIN_CHAIN_STEPS = 100_000
 EXCLUDE = {"thiophene"}  # abandoned; raw files left untouched
 JUMP_TOL = 0.05
 
+# Experimental reference densities (g/cm^3), where known -- fill in as they're confirmed.
+# CF4 confirmed by the user (2026-09-22); others from the previous writeup were unverified
+# memory recall and are deliberately NOT included here until sourced properly.
+REFERENCE_DENSITY = {"cf4": 1.26}
+REFERENCE_TOL_PCT = 5.0  # within this %, call it a match rather than "wrong plateau"
+
 
 def load(path):
     step, vol, rho, temp = [], [], [], []
@@ -61,6 +67,30 @@ def production_chain(d):
     return first, idx
 
 
+def find_equilibration(rho, n_blocks=15, slope_tol_pct=2.0, p_tol=0.05):
+    """Treat everything before some point as equilibration and discard it: scan
+    candidate start fractions 0%..90% of the production chain and return the
+    EARLIEST one after which the remaining trajectory shows no significant
+    linear trend (block-averaged) all the way to the end. That's a genuine
+    plateau, not just a locally-flat stretch that drifts again later.
+
+    Returns (start_frac, plateau_mean, plateau_sd, equilibrated: bool). If no
+    such point exists, the run never settles within its available length."""
+    n = len(rho)
+    for f in np.linspace(0, 0.9, 37):
+        i0 = int(f * n)
+        tail = rho[i0:]
+        if len(tail) < 200:
+            continue
+        blk = np.array([b.mean() for b in np.array_split(tail, min(n_blocks, len(tail)))])
+        lr = stats.linregress(np.arange(len(blk)), blk)
+        slope_pct = lr.slope * (len(blk) - 1) / blk.mean() * 100
+        if abs(slope_pct) < slope_tol_pct and lr.pvalue > p_tol:
+            return f, float(tail.mean()), float(tail.std()), True
+    tail = rho[-max(n // 10, 1):]
+    return None, float(tail.mean()), float(tail.std()), False
+
+
 def classify(path):
     d = load(path)
     first, idx = production_chain(d)
@@ -69,38 +99,43 @@ def classify(path):
     rho = c.rho.values
     n = len(rho)
     chain_steps = int(sum(c.step.values[g][-1] - c.step.values[g][0] for g in segments(c)))
-    rho_start, rho_end = rho[0], rho[-max(n // 10, 1):].mean()
-    half = rho[n // 2:]
-    blk = np.array([b.mean() for b in np.array_split(half, 10)])
-    lr = stats.linregress(np.arange(10), blk)
-    drift = lr.slope * 9 / blk.mean() * 100
-    if rho_end < 0.25 * rho_start:
+    rho_start = rho[0]
+    eq_frac, plateau, plateau_sd, equilibrated = find_equilibration(rho)
+    eq_step = int(eq_frac * n) if eq_frac is not None else None
+
+    parts = os.path.relpath(path, HERE).split(os.sep)
+    system = os.path.basename(path).split(".")[0]
+
+    if plateau < 0.25 * rho_start:
         label = "VAPORIZED (unconverged)"
     elif chain_steps < MIN_CHAIN_STEPS:
         label = "SHORT (too short to judge)"
-    elif abs(drift) > 2 and lr.pvalue < 0.01:
-        label = "UNCONVERGED (drifting)"
-    elif abs(drift) > 2 and lr.pvalue < 0.1:
-        label = "CONVERGED (marginal drift)"
+    elif not equilibrated:
+        label = "UNCONVERGED (never plateaus)"
     else:
-        label = "CONVERGED"
+        ref = REFERENCE_DENSITY.get(system)
+        if ref is not None:
+            err_pct = (plateau - ref) / ref * 100
+            label = "CONVERGED (matches exptl)" if abs(err_pct) <= REFERENCE_TOL_PCT                 else f"CONVERGED (WRONG PLATEAU, {err_pct:+.0f}% vs exptl)"
+        else:
+            label = "CONVERGED (plateau; no exptl reference)"
+
     notes = []
     if first > 0:
         notes.append(f"{first} earlier restart segment(s) not in production chain")
     if d.rho.min() < 0.25 * d.rho.iloc[0] and label.startswith("CONVERGED"):
         notes.append(f"earlier segments expanded to rho_min={d.rho.min():.3f}")
-    parts = os.path.relpath(path, HERE).split(os.sep)
     model = "anipbe0" if parts[0] == "anipbe0" else "anipbe0+mlxdm (assumed)"
     base = os.path.basename(path).split(".")
-    system = base[0]
     if "run1" in parts:
         system += "_run1"
         notes.append("early short trial (run1/)")
-    return d, first, dict(
+    return d, first, eq_step, dict(
         model=model, system=system, replica=int(base[1]), label=label,
         segments_in_file=len(idx), chain_from_segment=first + 1,
-        chain_steps=chain_steps, rho_initial=d.rho.iloc[0], rho_chain_end=rho_end,
-        rho_last_half_mean=half.mean(), last_half_drift_pct=drift, drift_p=lr.pvalue,
+        chain_steps=chain_steps, rho_initial=rho_start,
+        equilibrated_after_step=eq_step, plateau_rho=plateau, plateau_sd=plateau_sd,
+        exptl_rho=REFERENCE_DENSITY.get(system),
         T_mean_K=c["T"].mean(), rho_min_in_file=d.rho.min(), notes="; ".join(notes))
 
 
@@ -109,9 +144,9 @@ def main():
                    if os.path.basename(f).split(".")[0] not in EXCLUDE)
     results, data = [], {}
     for f in files:
-        d, first, row = classify(f)
+        d, first, eq_step, row = classify(f)
         results.append(row)
-        data[f] = (d, first, row)
+        data[f] = (d, first, eq_step, row)
     out = pd.DataFrame(results).sort_values(["model", "system", "replica"])
     out.round(4).to_csv(os.path.join(HERE, "convergence_labels.csv"), index=False)
     print(out.round(3).drop(columns=["segments_in_file", "rho_min_in_file"]).to_string(index=False))
@@ -127,18 +162,27 @@ def main():
             ax = axes[r, c]
             ax.set_facecolor(surface)
             sel = [(f, v) for f, v in data.items()
-                   if v[2]["system"] == sysname and v[2]["model"] == model and "run1" not in f]
+                   if v[3]["system"] == sysname and v[3]["model"] == model and "run1" not in f]
             if not sel:
                 ax.axis("off")
                 continue
-            for f, (d, first, row) in sorted(sel, key=lambda kv: kv[1][2]["replica"]):
+            for f, (d, first, eq_step, row) in sorted(sel, key=lambda kv: kv[1][3]["replica"]):
                 idx = segments(d)
                 offs = np.cumsum([0] + [d.step.values[g][-1] for g in idx[:-1]])
                 x = np.concatenate([offs[i] + d.step.values[g] for i, g in enumerate(idx)]) / 1e6
                 k = row["replica"]
-                ax.plot(x, d.rho.values, lw=0.9, color=colors[k], label=f"rep {k}: {row['label']}")
+                lbl = row["label"]
+                if row["plateau_rho"] is not None:
+                    lbl += f", {row['plateau_rho']:.3f} g/cm3"
+                ax.plot(x, d.rho.values, lw=0.9, color=colors[k], label=f"rep {k}: {lbl}")
                 if first > 0:
                     ax.axvline(offs[first] / 1e6, color=colors[k], lw=0.8, ls=(0, (3, 3)), alpha=0.7)
+                if eq_step is not None:
+                    ax.axvline((offs[first] + eq_step) / 1e6, color=colors[k], lw=1.1, ls=(0, (1, 1)), alpha=0.9)
+            if sysname in REFERENCE_DENSITY:
+                ax.axhline(REFERENCE_DENSITY[sysname], color=ink, lw=1.0, ls="-", alpha=0.5)
+                ax.text(0.01, REFERENCE_DENSITY[sysname], f" exptl {REFERENCE_DENSITY[sysname]:.2f}",
+                        fontsize=7, color=ink, va="bottom", transform=ax.get_yaxis_transform())
             ax.set_title(f"{names[sysname]} - {model}", loc="left", fontsize=10, color=ink)
             ax.grid(True, color="#e4e3df", lw=0.6)
             for s in ("top", "right"):
@@ -151,8 +195,9 @@ def main():
                 ax.set_ylabel("density (g/cm$^3$)", fontsize=9, color=ink2)
             if r == len(systems) - 1 or sysname == "ch3sch3" and c == 1 or sysname == "ccl4" and False:
                 ax.set_xlabel("cumulative MD steps, all restart segments (10$^6$)", fontsize=9, color=ink2)
-    fig.suptitle("Density time series, labelled. Dashed line = start of the production chain "
-                 "(earlier segments are restarts from the initial packing).", fontsize=10, color=ink, x=0.01, ha="left")
+    fig.suptitle("Density time series, labelled. Dashed = start of production chain (post-restart); "
+                 "dotted = equilibration cutoff (plateau begins); solid horizontal = experimental density, where known.",
+                 fontsize=10, color=ink, x=0.01, ha="left")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(os.path.join(HERE, "density_timeseries_overview.png"), dpi=140, facecolor=surface)
 
