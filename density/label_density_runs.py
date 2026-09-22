@@ -14,6 +14,12 @@ Labels
   UNCONVERGED (drifting)   last-half block means trend >2% with p < 0.01
   CONVERGED (marginal drift)  same trend but 0.01 <= p < 0.1
   CONVERGED                otherwise
+
+Each (system, model) has 3 replicates. The per-file `plateau_rho`/`plateau_sd` from
+find_equilibration() is frame-to-frame spread *within* one trajectory -- heavily
+autocorrelated MD samples, not an error bar. The correct uncertainty treatment is in
+replicate_summary(): treat each replicate's own post-equilibration mean as one
+independent sample (n=3) and take the spread *across* those.
 """
 import glob
 import os
@@ -139,6 +145,28 @@ def classify(path):
         T_mean_K=c["T"].mean(), rho_min_in_file=d.rho.min(), notes="; ".join(notes))
 
 
+def replicate_summary(out):
+    """Treat each replicate's post-equilibration plateau_rho as one independent
+    sample and report mean +/- spread ACROSS replicates (n=3), not within-trajectory
+    frame noise. Excludes replicas that never equilibrate (plateau isn't a valid
+    per-replicate estimate then) and the short run1/ trial systems."""
+    def agg(g):
+        n = len(g)
+        mean = g.plateau_rho.mean()
+        sd = g.plateau_rho.std(ddof=1) if n > 1 else np.nan
+        sem = sd / np.sqrt(n) if n > 1 else np.nan
+        ci95 = stats.t.ppf(0.975, n - 1) * sem if n > 1 else np.nan
+        exptl = g.exptl_rho.iloc[0]
+        row = dict(n_reps=n, mean_rho=mean, sd_across_reps=sd, sem=sem, ci95_halfwidth=ci95, exptl_rho=exptl)
+        if pd.notna(exptl):
+            row["err_pct"] = (mean - exptl) / exptl * 100
+            row["n_sem_from_exptl"] = abs(mean - exptl) / sem if sem and sem > 0 else np.inf
+        return pd.Series(row)
+
+    ok = out[~out.system.str.contains("run1") & out.equilibrated_after_step.notna() & (out.label != "VAPORIZED (unconverged)")]
+    return ok.groupby(["system", "model"], group_keys=True).apply(agg, include_groups=False)
+
+
 def main():
     files = sorted(f for f in glob.glob(os.path.join(HERE, "**", "*.density.csv"), recursive=True)
                    if os.path.basename(f).split(".")[0] not in EXCLUDE)
@@ -150,6 +178,11 @@ def main():
     out = pd.DataFrame(results).sort_values(["model", "system", "replica"])
     out.round(4).to_csv(os.path.join(HERE, "convergence_labels.csv"), index=False)
     print(out.round(3).drop(columns=["segments_in_file", "rho_min_in_file"]).to_string(index=False))
+
+    print()
+    rep = replicate_summary(out)
+    rep.round(4).to_csv(os.path.join(HERE, "replicate_summary.csv"))
+    print(rep.round(4).to_string())
 
     # ---- figure: one panel per (system, model); left column = +mlxdm, right = anipbe0
     systems = ["ccl4", "cf4", "ch3sch3", "ch3ssch3"]
