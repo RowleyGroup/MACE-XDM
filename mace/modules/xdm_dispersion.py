@@ -10,22 +10,46 @@
 #
 # For small structures (the typical training case: batches of independent
 # molecules of up to a few hundred atoms each) pairs are found via a dense
-# [n_nodes, n_nodes] distance matrix -- cheap relative to either neural
-# network's forward pass, and simplest to keep exactly-differentiable.
+# [n_nodes, n_nodes] distance matrix on the GPU -- cheap relative to either
+# neural network's forward pass, and simplest to keep exactly-differentiable.
 #
-# Above _DENSE_MAX_NODES, that dense matrix (and the same-sized boolean masks
+# Above dense_max_nodes, that dense matrix (and the same-sized boolean masks
 # built alongside it) becomes the dominant memory cost -- O(n_nodes^2) -- which
 # matters once this module is driven by an MD loop over a single large (e.g.
-# multi-hundred to multi-thousand atom) structure rather than a batch of small
-# ones. Above the threshold, pairs are instead found with a cell-list neighbor
-# search (matscipy, the same backend `mace.data.neighborhood.get_neighborhood`
-# uses for the short-range MACE cutoff), run once per graph on CPU -- giving
-# memory that scales with the true number of within-cutoff pairs instead of
-# with n_nodes^2. The per-pair energy formulas afterwards are identical in
-# both cases; only how (idx_i, idx_j, r) are produced differs.
+# multi-thousand atom) structure rather than a batch of small ones. Above the
+# threshold, pairs are instead found with a cell-list neighbor search
+# (matscipy, the same backend `mace.data.neighborhood.get_neighborhood` uses
+# for the short-range MACE cutoff), run once per graph on CPU -- giving memory
+# that scales with the true number of within-cutoff pairs instead of with
+# n_nodes^2, at the cost of a GPU->CPU->GPU round trip every call. The
+# per-pair energy formulas afterwards are identical in all cases; only how
+# (idx_i, idx_j, r) are produced differs.
+#
+# That CPU round trip dominates real MD wall time once the dense path's
+# O(n_nodes^2) memory gets too big to use: measured on an H100 (real
+# AtomicXDMMACE + this module, MACE-PBE0+XDM benchmark), the neighbor search
+# alone was 80-90% of the total step cost at 2700-6300 atoms, growing
+# supralinearly (~N^1.8) while the two neural networks stayed ~linear. Two
+# independent, stackable mitigations:
+#   1. dense_max_nodes raised from the old fixed 512 to 2048 (~150MB for the
+#      dense tensors at 2048 nodes -- negligible on any GPU this runs on) so
+#      more real MD sizes skip the CPU path entirely.
+#   2. use_position_cache=True, for whatever's still above that: an MD
+#      trajectory evaluates the *same* structure over and over with small
+#      per-step displacements, so instead of a fresh CPU search every call,
+#      search once at cutoff+cache_skin and reuse that candidate pair set
+#      until some atom has moved far enough that a pair could plausibly have
+#      entered/left the true cutoff shell (standard Verlet-list skin logic).
+#      Distances are still recomputed fresh from current positions every
+#      call, so results are numerically exact between rebuilds -- only the
+#      pair *set* is cached, not the energies. Measured locally: ~1 rebuild
+#      per 18 MD steps under Langevin dynamics. ONLY SAFE when forward() is
+#      called repeatedly on the same physical structure (an MD/relaxation
+#      loop) -- default is off, since it would silently corrupt batched
+#      training/eval over many unrelated molecules of the same atom count.
 ###########################################################################################
 
-from typing import Dict, List, Tuple, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import torch
@@ -56,9 +80,10 @@ class XDMDispersionEnergy(torch.nn.Module):
     alpha_free: torch.Tensor
     v_free: torch.Tensor
 
-    # Above this many nodes, switch pair-finding from a dense [n,n] distance
-    # matrix to a cell-list neighbor search (see module docstring).
-    _DENSE_MAX_NODES = 512
+    # Default above which pair-finding switches from a dense [n,n] GPU distance
+    # matrix to a CPU cell-list search (see module docstring). Override per
+    # instance via dense_max_nodes= if you know your GPU has room for more.
+    _DENSE_MAX_NODES = 2048
 
     def __init__(
         self,
@@ -67,6 +92,9 @@ class XDMDispersionEnergy(torch.nn.Module):
         cutoff: float = 14.0,
         a1: float = 0.4186,
         a2: float = 2.6791,
+        dense_max_nodes: int = _DENSE_MAX_NODES,
+        use_position_cache: bool = False,
+        cache_skin: float = 2.0,
     ):
         super().__init__()
         alpha_free_t = torch.as_tensor(alpha_free, dtype=torch.get_default_dtype())
@@ -80,12 +108,18 @@ class XDMDispersionEnergy(torch.nn.Module):
         self.register_buffer(
             "bohr_to_angstrom", torch.tensor(BOHR_TO_ANGSTROM, dtype=torch.get_default_dtype())
         )
+        self.dense_max_nodes = dense_max_nodes
+        self.use_position_cache = use_position_cache
+        self.cache_skin = cache_skin
+        self._cache_ref_positions: Optional[torch.Tensor] = None
+        self._cache_idx_i: Optional[torch.Tensor] = None
+        self._cache_idx_j: Optional[torch.Tensor] = None
 
     def _dense_pairs(
         self, positions: torch.Tensor, batch: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pair-finding via a dense [n,n] distance matrix. O(n_nodes^2) memory
-        -- only used below _DENSE_MAX_NODES nodes (see module docstring)."""
+        -- only used below dense_max_nodes nodes (see module docstring)."""
         n_nodes = positions.shape[0]
         diff = positions.unsqueeze(1) - positions.unsqueeze(0)  # [n,n,3]
         dist = torch.linalg.norm(diff, dim=-1)  # [n,n]
@@ -107,7 +141,59 @@ class XDMDispersionEnergy(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Pair-finding via a per-graph cell-list neighbor search (CPU,
         matscipy). Memory scales with the number of within-cutoff pairs
-        rather than n_nodes^2 -- used above _DENSE_MAX_NODES nodes."""
+        rather than n_nodes^2 -- used above dense_max_nodes nodes. Routes to
+        the Verlet-skin cache when that's enabled and safe (single graph)."""
+        if self.use_position_cache and num_graphs == 1:
+            return self._cached_sparse_pairs(positions)
+        return self._fresh_sparse_pairs(positions, batch, num_graphs)
+
+    def _cached_sparse_pairs(
+        self, positions: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Verlet-skin cache for the single-graph case: search once at
+        cutoff+cache_skin, then reuse that candidate pair set across calls
+        until some atom has moved more than cache_skin/2 since the last
+        search (so a pair could plausibly have crossed the true cutoff).
+        Distances are recomputed from the CURRENT positions every call, so
+        results are numerically identical to a fresh search between
+        rebuilds -- only which pairs to check is cached, not the energies.
+
+        Only call this when the same physical structure is evaluated
+        repeatedly with small per-step displacements (an MD or relaxation
+        loop) -- see the "use_position_cache" note in the module docstring
+        for why this is unsafe for batched/i.i.d. training or eval data."""
+        cutoff = float(self.cutoff.item())
+        ref = self._cache_ref_positions
+        rebuild = ref is None or ref.shape != positions.shape
+        if not rebuild:
+            disp = (positions.detach() - ref).norm(dim=-1).max()
+            rebuild = bool(2.0 * disp.item() > self.cache_skin)
+        if rebuild:
+            pos_np = positions.detach().cpu().numpy()
+            edge_index, _, _, _ = get_neighborhood(
+                positions=pos_np, cutoff=cutoff + self.cache_skin
+            )
+            sender, receiver = edge_index[0], edge_index[1]
+            keep = sender < receiver
+            self._cache_idx_i = torch.as_tensor(
+                sender[keep], dtype=torch.long, device=positions.device
+            )
+            self._cache_idx_j = torch.as_tensor(
+                receiver[keep], dtype=torch.long, device=positions.device
+            )
+            self._cache_ref_positions = positions.detach().clone()
+        idx_i, idx_j = self._cache_idx_i, self._cache_idx_j
+        assert idx_i is not None and idx_j is not None  # set on the rebuild branch above
+        r = torch.linalg.norm(positions[idx_i] - positions[idx_j], dim=-1)
+        mask = r < cutoff
+        return idx_i[mask], idx_j[mask], r[mask]
+
+    def _fresh_sparse_pairs(
+        self, positions: torch.Tensor, batch: torch.Tensor, num_graphs: int
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The uncached search: exact, safe for any batch of graphs, used
+        directly when use_position_cache is off and as the cache's own
+        rebuild step (at cutoff+cache_skin instead of cutoff) when it's on."""
         cutoff = float(self.cutoff.item())
         positions_np = positions.detach().cpu().numpy()
         batch_np = batch.detach().cpu().numpy()
@@ -163,7 +249,7 @@ class XDMDispersionEnergy(torch.nn.Module):
         alpha = veff * alpha_free_atom / v_free_atom  # [n_nodes]
 
         n_nodes = positions.shape[0]
-        if n_nodes > self._DENSE_MAX_NODES:
+        if n_nodes > self.dense_max_nodes:
             idx_i, idx_j, r = self._sparse_pairs(positions, batch, num_graphs)
         else:
             idx_i, idx_j, r = self._dense_pairs(positions, batch)

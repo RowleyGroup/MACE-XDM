@@ -481,11 +481,19 @@ def load_combined_model(
     dispersion_cutoff: float = 14.0,
     a1: float = 0.4186,
     a2: float = 2.6791,
+    dispersion_cache_skin: float = 2.0,
 ) -> torch.nn.Module:
     """Build a MACEXDMDispersion combined potential (macepbe0 + macexdm) from
     a short-range MACE-PBE0 model and a trained AtomicXDMMACE model, matching
     `MACEXDMDispersionCalculator`'s own construction (see
-    `mace/calculators/xdm_dispersion.py`)."""
+    `mace/calculators/xdm_dispersion.py`).
+
+    The dispersion term's Verlet-skin pair cache (XDMDispersionEnergy's
+    use_position_cache) is turned on here: this is exactly the safe case for
+    it (a single structure evaluated repeatedly across an MD/relaxation loop
+    with small per-step displacements) -- measured on an H100, the dispersion
+    pair search was 80-90% of the total per-step cost above dense_max_nodes
+    atoms without it. See mace/modules/xdm_dispersion.py's module docstring."""
     from mace.calculators.mace import get_model_dtype
     from mace.data import mlxdm_2x_polarizability_reference
     from mace.modules import MACEXDMDispersion, XDMDispersionEnergy, load_xdm_model
@@ -506,6 +514,8 @@ def load_combined_model(
         cutoff=dispersion_cutoff,
         a1=a1,
         a2=a2,
+        use_position_cache=True,
+        cache_skin=dispersion_cache_skin,
     )
 
     model = MACEXDMDispersion(

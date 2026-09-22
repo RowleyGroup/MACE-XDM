@@ -272,16 +272,106 @@ def test_xdm_dispersion_sparse_path_matches_dense_path():
     f_dense = -positions.grad.clone()
     positions.grad = None
 
-    module._DENSE_MAX_NODES = 1  # force the forward() dispatch onto the sparse path
+    module.dense_max_nodes = 1  # force the forward() dispatch onto the sparse path
     try:
         e_sparse = module(positions=positions, node_attrs=node_attrs, batch=batch, num_graphs=1, xdm_atomic=xdm_atomic)
         e_sparse.backward()
         f_sparse = -positions.grad.clone()
     finally:
-        module._DENSE_MAX_NODES = XDMDispersionEnergy._DENSE_MAX_NODES
+        module.dense_max_nodes = XDMDispersionEnergy._DENSE_MAX_NODES
 
     assert torch.allclose(e_dense, e_sparse, rtol=1e-10)
     assert torch.allclose(f_dense, f_sparse, atol=1e-8)
+
+
+def _random_structure(z_table, n_atoms, seed=0):
+    rng = np.random.RandomState(seed)
+    atomic_numbers = rng.choice(z_table.zs, size=n_atoms)
+    positions = torch.tensor(rng.randn(n_atoms, 3) * 6.0)
+    node_attrs = _build_two_atom_graph(z_table, atomic_numbers, positions)
+    batch = torch.zeros(n_atoms, dtype=torch.long)
+    xdm_atomic = torch.tensor(rng.rand(n_atoms, 4) * 5 + 1.0)
+    return positions, node_attrs, batch, xdm_atomic
+
+
+def test_xdm_dispersion_position_cache_matches_uncached():
+    """use_position_cache=True must give numerically identical energies to the
+    uncached path both on the rebuild call and after a small move that stays
+    inside the cache skin (reused candidate set, distances still recomputed
+    fresh) -- the cache changes which pairs are considered, never the maths."""
+    z_table = default_mlxdm_2x_atomic_number_table()
+    ref = mlxdm_2x_polarizability_reference(z_table)
+    n_atoms = 40
+    positions, node_attrs, batch, xdm_atomic = _random_structure(z_table, n_atoms)
+
+    uncached = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"], v_free=ref["v_free"], cutoff=14.0, dense_max_nodes=1
+    )
+    cached = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"],
+        v_free=ref["v_free"],
+        cutoff=14.0,
+        dense_max_nodes=1,
+        use_position_cache=True,
+        cache_skin=2.0,
+    )
+
+    kwargs = dict(node_attrs=node_attrs, batch=batch, num_graphs=1, xdm_atomic=xdm_atomic)
+    e_uncached_0 = uncached(positions=positions, **kwargs)
+    e_cached_0 = cached(positions=positions, **kwargs)
+    assert torch.allclose(e_uncached_0, e_cached_0, rtol=1e-12)
+    assert cached._cache_ref_positions is not None  # rebuilt on first call
+
+    # Small move, well inside the skin: cache should reuse its candidate set
+    # (no rebuild) but must still return the exact same energy as a fresh search.
+    rng = np.random.RandomState(1)
+    small_move = torch.tensor(rng.randn(n_atoms, 3) * 0.05)
+    moved = positions + small_move
+    ref_before = cached._cache_ref_positions.clone()
+    e_uncached_1 = uncached(positions=moved, **kwargs)
+    e_cached_1 = cached(positions=moved, **kwargs)
+    assert torch.equal(cached._cache_ref_positions, ref_before)  # confirms no rebuild happened
+    assert torch.allclose(e_uncached_1, e_cached_1, rtol=1e-10)
+
+    # Large move, beyond the skin: cache must rebuild and still agree.
+    large_move = torch.tensor(rng.randn(n_atoms, 3) * 5.0)
+    moved2 = positions + large_move
+    e_uncached_2 = uncached(positions=moved2, **kwargs)
+    e_cached_2 = cached(positions=moved2, **kwargs)
+    assert not torch.equal(cached._cache_ref_positions, ref_before)  # confirms it did rebuild
+    assert torch.allclose(e_uncached_2, e_cached_2, rtol=1e-10)
+
+
+def test_xdm_dispersion_position_cache_ignored_for_batched_graphs():
+    """The cache is only safe for a single structure evaluated repeatedly
+    (an MD/relaxation loop); for a batch of independent molecules (num_graphs
+    > 1, as in training/eval) it must be silently bypassed rather than
+    caching stale pairs against unrelated structures."""
+    z_table = default_mlxdm_2x_atomic_number_table()
+    ref = mlxdm_2x_polarizability_reference(z_table)
+    n_per_graph = 20
+    p1, na1, _, x1 = _random_structure(z_table, n_per_graph, seed=0)
+    p2, na2, _, x2 = _random_structure(z_table, n_per_graph, seed=1)
+    positions = torch.cat([p1, p2])
+    node_attrs = torch.cat([na1, na2])
+    batch = torch.cat([torch.zeros(n_per_graph, dtype=torch.long), torch.ones(n_per_graph, dtype=torch.long)])
+    xdm_atomic = torch.cat([x1, x2])
+
+    cached = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"],
+        v_free=ref["v_free"],
+        cutoff=14.0,
+        dense_max_nodes=1,
+        use_position_cache=True,
+    )
+    uncached = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"], v_free=ref["v_free"], cutoff=14.0, dense_max_nodes=1
+    )
+    kwargs = dict(node_attrs=node_attrs, batch=batch, num_graphs=2, xdm_atomic=xdm_atomic)
+    e_cached = cached(positions=positions, **kwargs)
+    e_uncached = uncached(positions=positions, **kwargs)
+    assert torch.allclose(e_cached, e_uncached, rtol=1e-10)
+    assert cached._cache_ref_positions is None  # never touched -- fell through to the fresh path
 
 
 def test_mace_xdm_dispersion_unsupported_element_raises():

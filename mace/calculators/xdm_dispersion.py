@@ -45,6 +45,7 @@ class MACEXDMDispersionCalculator(Calculator):
         a2: float = 2.6791,
         alpha_free: Optional[np.ndarray] = None,
         v_free: Optional[np.ndarray] = None,
+        dispersion_cache_skin: float = 2.0,
         **kwargs,
     ):
         Calculator.__init__(self, **kwargs)
@@ -67,8 +68,18 @@ class MACEXDMDispersionCalculator(Calculator):
             ref = mlxdm_2x_polarizability_reference(xdm_z_table)
             alpha_free = ref["alpha_free"]
             v_free = ref["v_free"]
+        # use_position_cache=True: an ASE Dynamics/Optimizer calls calculate()
+        # on this same Atoms object over and over with small per-step moves --
+        # exactly the case the Verlet-skin pair cache is safe and built for
+        # (see XDMDispersionEnergy's module docstring).
         dispersion_energy = XDMDispersionEnergy(
-            alpha_free=alpha_free, v_free=v_free, cutoff=dispersion_cutoff, a1=a1, a2=a2
+            alpha_free=alpha_free,
+            v_free=v_free,
+            cutoff=dispersion_cutoff,
+            a1=a1,
+            a2=a2,
+            use_position_cache=True,
+            cache_skin=dispersion_cache_skin,
         )
 
         self.model = MACEXDMDispersion(
