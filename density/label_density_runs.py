@@ -30,10 +30,10 @@ MIN_CHAIN_STEPS = 100_000
 EXCLUDE = {"thiophene"}  # abandoned; raw files left untouched
 JUMP_TOL = 0.05
 
-# Experimental reference densities (g/cm^3), where known -- fill in as they're confirmed.
-# CF4 confirmed by the user (2026-09-22); others from the previous writeup were unverified
-# memory recall and are deliberately NOT included here until sourced properly.
-REFERENCE_DENSITY = {"cf4": 1.26}
+# Experimental reference densities (g/cm^3), user-confirmed (2026-09-22). ch3ssch3 read from
+# a message that named "CH3SCH3" twice -- taken as a typo for ch3ssch3 (dimethyl disulfide),
+# the only system otherwise left without a reference; flag if that reading is wrong.
+REFERENCE_DENSITY = {"cf4": 1.26, "ccl4": 1.59, "ch3sch3": 0.846, "ch3ssch3": 1.046}
 REFERENCE_TOL_PCT = 5.0  # within this %, call it a match rather than "wrong plateau"
 
 
