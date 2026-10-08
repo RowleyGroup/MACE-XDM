@@ -47,6 +47,11 @@
 #      called repeatedly on the same physical structure (an MD/relaxation
 #      loop) -- default is off, since it would silently corrupt batched
 #      training/eval over many unrelated molecules of the same atom count.
+#      The cache can only tell structures apart by shape and a displacement
+#      heuristic, not identity, so a caller that reuses one instance across
+#      *distinct* same-atom-count structures (e.g. a calculator doing batch
+#      inference over many molecules one at a time) must call reset_cache()
+#      between them -- MACEXDMDispersionCalculator does this automatically.
 ###########################################################################################
 
 from typing import Dict, List, Optional, Tuple, Union
@@ -114,6 +119,27 @@ class XDMDispersionEnergy(torch.nn.Module):
         self._cache_ref_positions: Optional[torch.Tensor] = None
         self._cache_idx_i: Optional[torch.Tensor] = None
         self._cache_idx_j: Optional[torch.Tensor] = None
+
+    def reset_cache(self) -> None:
+        """Discard the Verlet-skin pair cache, forcing a fresh CPU search on
+        the next call. Call this whenever forward() is about to be run on a
+        structure unrelated to whatever it last cached -- e.g. a calculator
+        switching to a different Atoms object -- since the cache otherwise
+        only checks positions.shape and a max-displacement heuristic, which
+        cannot tell two distinct same-atom-count structures apart."""
+        self._cache_ref_positions = None
+        self._cache_idx_i = None
+        self._cache_idx_j = None
+
+    def _apply(self, fn, recurse=True):
+        # nn.Module.to()/.cuda()/.float() etc. go through here. The cache
+        # tensors are plain attributes (not buffers/parameters, since they're
+        # a derived index cache rather than model state), so the base
+        # implementation won't move them -- reusing them post-move would mix
+        # devices/dtypes and crash. Simplest safe fix: drop the cache here so
+        # it transparently rebuilds against whatever comes next.
+        self.reset_cache()
+        return super()._apply(fn, recurse=recurse)
 
     def _dense_pairs(
         self, positions: torch.Tensor, batch: torch.Tensor
@@ -193,7 +219,11 @@ class XDMDispersionEnergy(torch.nn.Module):
     ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """The uncached search: exact, safe for any batch of graphs, used
         directly when use_position_cache is off and as the cache's own
-        rebuild step (at cutoff+cache_skin instead of cutoff) when it's on."""
+        rebuild step (at cutoff+cache_skin instead of cutoff) when it's on.
+        Re-filters to a strict r < cutoff at the end, matching _dense_pairs
+        and _cached_sparse_pairs -- matscipy's neighbour_list can include a
+        pair at exactly the cutoff distance, which the other two paths do
+        not, and this keeps all three backends agreeing on boundary pairs."""
         cutoff = float(self.cutoff.item())
         positions_np = positions.detach().cpu().numpy()
         batch_np = batch.detach().cpu().numpy()
@@ -225,7 +255,8 @@ class XDMDispersionEnergy(torch.nn.Module):
         idx_j = torch.cat(all_j).to(positions.device)
         diff = positions[idx_i] - positions[idx_j]  # [n_pairs, 3]
         r = torch.linalg.norm(diff, dim=-1)  # [n_pairs]
-        return idx_i, idx_j, r
+        mask = r < cutoff
+        return idx_i[mask], idx_j[mask], r[mask]
 
     def forward(
         self,
@@ -269,6 +300,15 @@ class XDMDispersionEnergy(torch.nn.Module):
         c6 = m1_i * m1_j / denom
         c8 = 1.5 * (m1_i * m2_j + m1_j * m2_i) / denom
         c10 = 2.0 * (m1_i * m3_j + m3_i * m1_j + 2.1 * m2_i * m2_j) / denom
+        # Physically these are all positive (even moments of a positive exchange
+        # hole), but nothing upstream constrains an undertrained/OOD AtomicXDMMACE
+        # readout to predict a positive M1/M2/M3 -- a single negative moment makes
+        # c6/c8/c10 negative, and sqrt()/a fractional power of that is NaN, which
+        # would otherwise silently poison this whole batch's loss and gradient.
+        # Clamping to a tiny positive floor keeps well-behaved values untouched.
+        c6 = c6.clamp_min(1e-12)
+        c8 = c8.clamp_min(1e-12)
+        c10 = c10.clamp_min(1e-12)
 
         r_crit = (
             torch.sqrt(c8 / c6) + torch.pow(c10 / c6, 0.25) + torch.sqrt(c10 / c8)

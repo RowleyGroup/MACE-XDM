@@ -13,6 +13,7 @@
 # training scheme.
 ###########################################################################################
 
+import logging
 from typing import Dict, Optional
 
 import torch
@@ -70,6 +71,32 @@ class MACEXDMDispersion(torch.nn.Module):
             "xdm_atomic_numbers_table", torch.tensor(xdm_zs, dtype=torch.long)
         )
         self.num_elements_sr = len(sr_zs)
+
+        # forward() reuses the ONE AtomicData graph it's given for both
+        # sub-models -- it never rebuilds a second graph at the short-range
+        # model's own r_max. If that graph was cut off at xdm_model.r_max (the
+        # common convention, since callers build it keyed to the XDM z_table)
+        # and short_range_model needs a wider cutoff, real neighbors within its
+        # r_max are simply missing from edge_index, silently shrinking its
+        # receptive field. This can't see what cutoff the caller actually used
+        # to build the graph, only the two models' own r_max, so it's a
+        # best-effort warning, not a guarantee -- the fix belongs at the graph
+        # construction call (use cutoff=max(short_range_model.r_max,
+        # xdm_model.r_max); see MACEXDMDispersionCalculator.r_max).
+        try:
+            sr_r_max = float(short_range_model.r_max.item())
+            xdm_r_max = float(xdm_model.r_max.item())
+        except AttributeError:
+            sr_r_max = xdm_r_max = None
+        if sr_r_max is not None and sr_r_max > xdm_r_max:
+            logging.warning(
+                f"short_range_model.r_max ({sr_r_max}) > xdm_model.r_max "
+                f"({xdm_r_max}). If the AtomicData graph passed to forward() "
+                f"was built at xdm_model's r_max (the usual convention), the "
+                f"short-range model will silently lose real neighbors beyond "
+                f"{xdm_r_max} A. Build the graph with "
+                f"cutoff=max(short_range_model.r_max, xdm_model.r_max) instead."
+            )
 
     def forward(
         self,

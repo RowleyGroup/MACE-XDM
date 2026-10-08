@@ -90,10 +90,30 @@ class MACEXDMDispersionCalculator(Calculator):
         self.model.eval()
 
         self.z_table = xdm_z_table
-        self.r_max = r_max if r_max is not None else float(xdm_model.r_max.item())
+        # Both sub-models share the one AtomicData graph built below; it must be
+        # cut off at least as wide as either model needs, or the short-range
+        # model silently loses real within-its-cutoff neighbors whenever its
+        # r_max exceeds the XDM model's.
+        self.r_max = (
+            r_max
+            if r_max is not None
+            else max(float(xdm_model.r_max.item()), float(short_range_model.r_max.item()))
+        )
+        self._last_atoms_id: Optional[int] = None
 
     def calculate(self, atoms=None, properties=None, system_changes=all_changes):
         Calculator.calculate(self, atoms)
+
+        # The dispersion position cache (use_position_cache=True above) can only
+        # tell structures apart by shape/displacement, not identity -- reusing
+        # this calculator across distinct Atoms objects (e.g. a screening loop
+        # over many molecules) would otherwise silently reuse a previous
+        # molecule's stale pair list. An ASE Dynamics/Optimizer loop keeps
+        # calling calculate() on the SAME Atoms object, so id(atoms) alone
+        # distinguishes "still the same trajectory" from "a different molecule".
+        if id(atoms) != self._last_atoms_id:
+            self.model.dispersion_energy.reset_cache()
+            self._last_atoms_id = id(atoms)
 
         targets = np.zeros((len(atoms), 4))
         with torch_tools.default_dtype(self.default_dtype):

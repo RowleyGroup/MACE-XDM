@@ -12,6 +12,7 @@ import argparse
 import glob
 import json
 import logging
+import math
 import time
 from functools import partial
 from pathlib import Path
@@ -133,11 +134,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--interaction_first",
         default="RealAgnosticResidualInteractionBlock",
         choices=list(interaction_classes.keys()),
-        help="Defaults to RealAgnosticResidualInteractionBlock here (unlike "
-        "mace_run_train_xdm's RealAgnosticInteractionBlock default) so the "
-        "two scripts match unless you override both explicitly -- pin this "
-        "the same way in both if you plan to --foundation_model warm-start "
-        "an XDM fine-tune from this model.",
+        help="Matches mace_run_train_xdm's own default -- keep this the same "
+        "in both if you plan to --foundation_model warm-start an XDM "
+        "fine-tune from this model, since a mismatched first interaction "
+        "block silently weakens the backbone-tensor transplant.",
     )
     parser.add_argument("--num_interactions", type=int, default=2)
     parser.add_argument("--hidden_irreps", default="128x0e + 128x1o")
@@ -185,7 +185,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--patience",
         type=int,
         default=20,
-        help="Epochs without validation improvement before early stopping.",
+        help="Evaluations (one every --eval_interval epochs, not every "
+        "epoch) without validation improvement before early stopping.",
     )
     parser.add_argument("--lr_factor", type=float, default=0.5)
     parser.add_argument("--lr_scheduler_patience", type=int, default=10)
@@ -552,6 +553,15 @@ def main():
 
         if epoch % args.eval_interval == 0 or epoch == args.max_num_epochs - 1:
             metrics = evaluate(model, valid_loader, device, loss_fn)
+            if math.isnan(metrics["loss"]):
+                # Same failure mode as mace_run_train_xdm: best_path is only
+                # written below when loss improves, so NaN loss means it's
+                # never created and the unconditional torch.load(best_path)
+                # after the loop crashes with a confusing FileNotFoundError.
+                raise RuntimeError(
+                    f"Validation loss is NaN at epoch {epoch} -- training has "
+                    "diverged. Try a lower --lr, or enable --clip_grad_norm."
+                )
             lr_before = optimizer.param_groups[0]["lr"]
             scheduler.step(metrics["loss"])
             lr_after = optimizer.param_groups[0]["lr"]

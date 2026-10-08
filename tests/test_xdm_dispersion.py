@@ -374,6 +374,142 @@ def test_xdm_dispersion_position_cache_ignored_for_batched_graphs():
     assert cached._cache_ref_positions is None  # never touched -- fell through to the fresh path
 
 
+def test_xdm_dispersion_reset_cache_forces_rebuild():
+    """reset_cache() must drop the Verlet-skin cache so the next call does a
+    fresh search, regardless of whether the displacement heuristic alone
+    would have triggered one -- the escape hatch a caller reusing one
+    instance across distinct structures needs (see MACEXDMDispersionCalculator)."""
+    z_table = default_mlxdm_2x_atomic_number_table()
+    ref = mlxdm_2x_polarizability_reference(z_table)
+    n_atoms = 30
+    positions, node_attrs, batch, xdm_atomic = _random_structure(z_table, n_atoms)
+    kwargs = dict(node_attrs=node_attrs, batch=batch, num_graphs=1, xdm_atomic=xdm_atomic)
+
+    module = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"], v_free=ref["v_free"], cutoff=14.0, dense_max_nodes=1,
+        use_position_cache=True,
+    )
+    module(positions=positions, **kwargs)
+    assert module._cache_ref_positions is not None
+
+    module.reset_cache()
+    assert module._cache_ref_positions is None
+    assert module._cache_idx_i is None
+    assert module._cache_idx_j is None
+
+    # Next call must rebuild (not crash on the cleared cache) and still agree
+    # with a fully uncached evaluation.
+    uncached = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"], v_free=ref["v_free"], cutoff=14.0, dense_max_nodes=1,
+    )
+    e_cached = module(positions=positions, **kwargs)
+    e_uncached = uncached(positions=positions, **kwargs)
+    assert module._cache_ref_positions is not None
+    assert torch.allclose(e_cached, e_uncached, rtol=1e-10)
+
+
+def test_xdm_dispersion_apply_resets_cache():
+    """The cache tensors are plain attributes, not buffers/parameters, so
+    nn.Module._apply (which .to()/.double()/.float()/.cuda() all go through)
+    won't move them itself. Reusing a stale, now-wrong-device/dtype cache
+    afterwards would crash; _apply is overridden to drop the cache instead
+    so the next call transparently rebuilds."""
+    z_table = default_mlxdm_2x_atomic_number_table()
+    ref = mlxdm_2x_polarizability_reference(z_table)
+    n_atoms = 30
+    positions, node_attrs, batch, xdm_atomic = _random_structure(z_table, n_atoms)
+    kwargs = dict(node_attrs=node_attrs, batch=batch, num_graphs=1, xdm_atomic=xdm_atomic)
+
+    module = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"], v_free=ref["v_free"], cutoff=14.0, dense_max_nodes=1,
+        use_position_cache=True,
+    )
+    module(positions=positions, **kwargs)
+    assert module._cache_ref_positions is not None
+
+    module.float()  # exercises _apply; no-op numerically for this test's purposes
+    assert module._cache_ref_positions is None
+    assert module._cache_idx_i is None
+    assert module._cache_idx_j is None
+
+    module.double()
+    # Must not crash reusing a cache built under a different dtype, and must
+    # produce a fresh, correct cache again.
+    module(positions=positions, **kwargs)
+    assert module._cache_ref_positions is not None
+
+
+def test_xdm_dispersion_negative_moments_do_not_produce_nan():
+    """c6/c8/c10 are physically positive (even moments of a positive exchange
+    hole), but nothing upstream constrains an AtomicXDMMACE readout to
+    predict positive M1/M2/M3 -- an undertrained/OOD prediction can go
+    negative, and sqrt()/a fractional power of that is NaN, which would
+    otherwise poison the whole graph's energy (and, via autograd, every
+    parameter touched by that batch)."""
+    z_table = AtomicNumberTable([1, 6])
+    ref = mlxdm_2x_polarizability_reference(z_table)
+    module = XDMDispersionEnergy(alpha_free=ref["alpha_free"], v_free=ref["v_free"], cutoff=14.0)
+
+    positions = torch.tensor([[0.0, 0.0, 0.0], [3.0, 0.0, 0.0]], requires_grad=True)
+    node_attrs = _build_two_atom_graph(z_table, [1, 6], positions)
+    batch = torch.zeros(2, dtype=torch.long)
+    # A negative M1 on atom A alone drives c6 = M1_A*M1_B/denom negative
+    # (denom = M1_A/alpha_A + M1_B/alpha_B, also now negative-dominated).
+    xdm_atomic = torch.tensor([[-1.0, 10.0, 100.0, 6.0], [3.0, 20.0, 300.0, 25.0]])
+
+    e = module(positions=positions, node_attrs=node_attrs, batch=batch, num_graphs=1, xdm_atomic=xdm_atomic)
+    assert torch.isfinite(e).all()
+    e.sum().backward()
+    assert torch.isfinite(positions.grad).all()
+
+
+def test_xdm_dispersion_dense_and_sparse_agree_at_exact_cutoff():
+    """matscipy's neighbour_list (the sparse path's backend) includes a pair
+    exactly at the cutoff distance; the dense path's `dist < cutoff` does
+    not. Both _fresh_sparse_pairs and _cached_sparse_pairs re-filter to a
+    strict `r < cutoff` so all three pair-finding strategies agree on this
+    boundary, as the module docstring claims they do."""
+    z_table = AtomicNumberTable([1, 6])
+    ref = mlxdm_2x_polarizability_reference(z_table)
+    cutoff = 5.0
+    module = XDMDispersionEnergy(
+        alpha_free=ref["alpha_free"], v_free=ref["v_free"], cutoff=cutoff, dense_max_nodes=1,
+    )
+    positions = torch.tensor([[0.0, 0.0, 0.0], [cutoff, 0.0, 0.0]])  # exactly at cutoff
+    node_attrs = _build_two_atom_graph(z_table, [1, 6], positions)
+    batch = torch.zeros(2, dtype=torch.long)
+
+    idx_i_dense, idx_j_dense, _ = module._dense_pairs(positions, batch)
+    idx_i_sparse, idx_j_sparse, _ = module._fresh_sparse_pairs(positions, batch, num_graphs=1)
+    assert idx_i_dense.numel() == 0
+    assert idx_i_sparse.numel() == 0, (
+        "matscipy's neighbour_list includes the exact-cutoff pair (its own "
+        "convention), so this only passes if _fresh_sparse_pairs re-filters"
+    )
+
+
+def test_mace_xdm_dispersion_r_max_mismatch_warns(caplog):
+    """If short_range_model needs a wider cutoff than xdm_model, the ONE
+    shared graph built at xdm_model's r_max (the usual convention) silently
+    truncates the short-range model's receptive field. MACEXDMDispersion
+    can't see what cutoff the caller actually built the graph with, so this
+    is a best-effort warning, not a guarantee -- but it must fire."""
+    xdm_z_table = default_mlxdm_2x_atomic_number_table()
+    xdm_model = _build_xdm_model(xdm_z_table)  # r_max=5.0, see _build_xdm_model
+    assert float(xdm_model.r_max.item()) == 5.0
+
+    sr_z_table = AtomicNumberTable([8, 1, 6])
+    sr_model = _build_short_range_model(sr_z_table, atomic_energies=[-75.0, -0.5, -37.8])
+    sr_model.r_max = torch.tensor(6.0, dtype=torch.get_default_dtype())  # wider than xdm's
+
+    disp_ref = mlxdm_2x_polarizability_reference(xdm_z_table)
+    disp_module = XDMDispersionEnergy(alpha_free=disp_ref["alpha_free"], v_free=disp_ref["v_free"])
+
+    with caplog.at_level("WARNING"):
+        MACEXDMDispersion(short_range_model=sr_model, xdm_model=xdm_model, dispersion_energy=disp_module)
+    assert any("r_max" in rec.message for rec in caplog.records)
+
+
 def test_mace_xdm_dispersion_unsupported_element_raises():
     xdm_z_table = default_mlxdm_2x_atomic_number_table()
     xdm_model = _build_xdm_model(xdm_z_table)

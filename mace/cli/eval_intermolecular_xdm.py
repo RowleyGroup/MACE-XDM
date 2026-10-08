@@ -114,7 +114,9 @@ def expand_file_patterns(patterns: List[str]) -> List[str]:
     files: List[str] = []
     for pattern in patterns:
         matches = sorted(glob.glob(pattern))
-        files.extend(matches if matches else [pattern])
+        if not matches:
+            raise FileNotFoundError(f"No files matched '{pattern}'")
+        files.extend(matches)
     return files
 
 
@@ -187,7 +189,11 @@ def main():
     short_range_model = load_full_model(args.short_range_model, device=device)
     xdm_model = load_xdm_model(args.xdm_model, device=device)
     xdm_z_table = AtomicNumberTable(xdm_model.atomic_numbers.tolist())
-    r_max = float(xdm_model.r_max.item())
+    # The one graph built below (keyed to xdm_z_table) is shared by both
+    # sub-models -- cut it off at whichever model needs the wider cutoff, or
+    # the short-range model silently loses real neighbors beyond its own
+    # r_max (see the matching note in MACEXDMDispersion.__init__).
+    r_max = max(float(xdm_model.r_max.item()), float(short_range_model.r_max.item()))
     logging.info(
         f"Short-range model elements: {short_range_model.atomic_numbers.tolist()}; "
         f"XDM model elements: {xdm_z_table.zs}, r_max={r_max}"

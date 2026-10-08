@@ -6,7 +6,7 @@ import numpy as np
 import torch
 from e3nn import o3
 
-from mace.cli.eval_intermolecular_xdm import discover_triplets, main
+from mace.cli.eval_intermolecular_xdm import discover_triplets, expand_file_patterns, main
 from mace.modules import (
     MACE,
     AtomicXDMMACE,
@@ -297,3 +297,19 @@ def test_main_cli_skip_homonuclear_fragments_flag(tmp_path, monkeypatch, caplog)
     report2 = json.loads((output_dir2 / "intermolecular_report.json").read_text())
     for key in report2:
         assert report2[key]["n"] == 3
+
+
+def test_expand_file_patterns_raises_on_no_match(tmp_path):
+    # Previously fell back to keeping the literal unmatched glob string as a
+    # "file path", unlike the same-named helper in run_train_xdm.py/
+    # run_train_pbe0.py (which raise immediately) -- a typo'd pattern only
+    # surfaced later as an unrelated-looking OSError from h5py.File().
+    existing = tmp_path / "real.h5"
+    existing.write_bytes(b"")
+    assert expand_file_patterns([str(existing)]) == [str(existing)]
+
+    try:
+        expand_file_patterns([str(tmp_path / "does_not_exist_*.h5")])
+        assert False, "expected FileNotFoundError"
+    except FileNotFoundError as exc:
+        assert "does_not_exist_*.h5" in str(exc)

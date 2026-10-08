@@ -7,6 +7,7 @@ import argparse
 import glob
 import json
 import logging
+import math
 import time
 from functools import partial
 from pathlib import Path
@@ -148,8 +149,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--interaction_first",
-        default="RealAgnosticInteractionBlock",
+        default="RealAgnosticResidualInteractionBlock",
         choices=list(interaction_classes.keys()),
+        help="Matches mace_run_train_pbe0's and stock mace_run_train's own "
+        "default -- keep this the same in both if you plan to "
+        "--foundation_model warm-start an XDM fine-tune from a PBE0 model, "
+        "since a mismatched first interaction block silently weakens the "
+        "backbone-tensor transplant.",
     )
     parser.add_argument("--num_interactions", type=int, default=2)
     parser.add_argument("--hidden_irreps", default="128x0e + 128x1o")
@@ -212,7 +218,8 @@ def build_parser() -> argparse.ArgumentParser:
         "--patience",
         type=int,
         default=20,
-        help="Epochs without validation improvement before early stopping.",
+        help="Evaluations (one every --eval_interval epochs, not every "
+        "epoch) without validation improvement before early stopping.",
     )
     parser.add_argument(
         "--lr_factor",
@@ -633,6 +640,18 @@ def main():
 
     if args.foundation_model and not latest_path.exists():
         warm_start_from_foundation_model(model, args.foundation_model, device)
+    elif args.foundation_model and latest_path.exists() and not args.restart_latest:
+        # latest_path existing takes precedence over warm-starting fresh (we
+        # won't silently discard a checkpoint from a previous run), but that
+        # was previously silent: with --restart_latest also not passed, the
+        # model fell all the way through to random initialization with no
+        # indication --foundation_model was ever ignored.
+        logging.warning(
+            f"{latest_path} already exists, so --foundation_model warm-start "
+            "is being skipped (pass --restart_latest to resume training from "
+            "it instead). Model is at random initialization. If you meant to "
+            "warm-start fresh, remove that checkpoint file first."
+        )
 
     if args.restart_latest and latest_path.exists():
         checkpoint = torch.load(latest_path, map_location=device, weights_only=False)
@@ -691,6 +710,17 @@ def main():
             metrics = evaluate(
                 model, valid_loader, device, loss_weights, len(target_keys)
             )
+            if math.isnan(metrics["loss"]):
+                # best_path is only ever written below when loss improves on
+                # best_valid_loss -- "NaN < anything" is always False in
+                # Python, so if this is ever reached the file is never
+                # created, and the unconditional torch.load(best_path) after
+                # the training loop crashes with a confusing FileNotFoundError
+                # that hides the actual cause. Fail loudly here instead.
+                raise RuntimeError(
+                    f"Validation loss is NaN at epoch {epoch} -- training has "
+                    "diverged. Try a lower --lr, or enable --clip_grad_norm."
+                )
             lr_before = optimizer.param_groups[0]["lr"]
             scheduler.step(metrics["loss"])
             lr_after = optimizer.param_groups[0]["lr"]
