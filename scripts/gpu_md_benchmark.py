@@ -27,8 +27,6 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import gpu_md  # noqa: E402  (needs the sys.path.insert above)
 
-DEFAULT_XYZ_DIR = "/lustre06/project/6060902/crowley/timing/xyz"
-
 T = 298.15
 MD_STEPS = 100000
 TIMESTEP_FS = 1.0
@@ -197,8 +195,8 @@ def main():
     parser.add_argument("--xdm-model", default=None,
                          help="Path to a trained AtomicXDMMACE model/checkpoint "
                               "(required for the pbe0_xdm model choice)")
-    parser.add_argument("--xyz-dir", default=DEFAULT_XYZ_DIR,
-                         help="Directory of water-ball xyz files (default: %(default)s)")
+    parser.add_argument("--xyz-dir", default=None,
+                         help="Directory of water-ball xyz files (required unless --xyz-file is given)")
     parser.add_argument("--pattern", default="water_ball_*.xyz",
                          help="Glob pattern for xyz files within --xyz-dir (default: %(default)s)")
     parser.add_argument("--limit", type=int, default=None,
@@ -235,6 +233,8 @@ def main():
         stem = os.path.splitext(os.path.basename(args.xyz_file))[0]
         default_csv = f"simulation_timings_{args.model}_gpu_{stem}.csv"
     else:
+        if args.xyz_dir is None:
+            parser.error("--xyz-dir is required unless --xyz-file is given")
         xyz_files = find_xyz_files(args.xyz_dir, args.pattern)
         if args.stride > 1:
             xyz_files = xyz_files[::args.stride]

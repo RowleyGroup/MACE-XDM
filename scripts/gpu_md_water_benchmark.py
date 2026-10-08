@@ -33,8 +33,6 @@ from ase.io.trajectory import Trajectory
 
 from scripts.gpu_md import System, init_maxwell_boltzmann, langevin
 
-DEFAULT_XYZ_DIR = "/lustre06/project/6060902/crowley/timing/xyz"
-
 # Hartree -> eV (CODATA 2018), used only for the MLXDM dispersion term, which reports
 # energies in Hartree following torchani/torchanipbe0 convention.
 HARTREE_TO_EV = 27.211386245988
@@ -241,8 +239,8 @@ def main() -> None:
                          help="Path to the MACEPBE0 MACE checkpoint (.model file). Used "
                               "for both 'macepbe0' and 'macexdm' (macexdm additionally "
                               "adds torchanipbe0's bundled MLXDM_2x dispersion module).")
-    parser.add_argument("--xyz-dir", default=DEFAULT_XYZ_DIR,
-                         help="Directory of water-ball xyz files (default: %(default)s)")
+    parser.add_argument("--xyz-dir", default=None,
+                         help="Directory of water-ball xyz files (required unless --xyz-file is given)")
     parser.add_argument("--pattern", default="water_ball_*.xyz",
                          help="Glob pattern for xyz files within --xyz-dir (default: %(default)s)")
     parser.add_argument("--limit", type=int, default=None,
@@ -273,6 +271,8 @@ def main() -> None:
         stem = os.path.splitext(os.path.basename(args.xyz_file))[0]
         default_csv = f"simulation_timings_{args.model}_gpu_{stem}.csv"
     else:
+        if args.xyz_dir is None:
+            parser.error("--xyz-dir is required unless --xyz-file is given")
         xyz_files = find_xyz_files(args.xyz_dir, args.pattern)
         if args.limit is not None:
             xyz_files = xyz_files[:args.limit]
